@@ -19,7 +19,7 @@
 |---|---|---|---|---|---|
 | 0 | 스파이크: 미확정 동작 검증 | §7.2-4, §9.3 | – | 아래 절 4항목 결과 기록 | 완료 |
 | 1 | `resource`, `domain` | §4, §8.1, §9.3 표, R25 | §3.1, §3.4 | TESTPLAN (resource), (domain) | 완료 2026-09-06 (게이트 3회차 PASS, findings=0. 커밋 73c497c 문서 / 92a4abc 코드) |
-| 2 | `config` | §6 전체, R2~R15·R17~R20·R23 필수성·R25 | §8 | TESTPLAN (config). `examples/gh-ars.yaml` 로드 성공 | 미착수 |
+| 2 | `config` | §6 전체, R2~R15·R17~R20·R23 필수성·R25 | §8 | TESTPLAN (config). `examples/gh-ars.yaml` 로드 성공 | 완료 2026-09-06 (게이트 4회차 PASS, findings=1 doc-gap만 잔존. 커밋 06f4baf. yaml.v3 도입) |
 | 3 | `plan` | §7.2-3, §8.1~§8.3 | §5, §3.2 집계 정의 | TESTPLAN (plan) | 미착수 |
 | 4 | `executor/local` | §5 Executor, §10.2(local 사용자 권한) | §4.1 | TESTPLAN (executor/local) | 미착수 |
 | 5 | `runtime/docker` + `jittar` | §7.2-4 none 래퍼·tar, §9.1 볼륨·라벨, §4.2 라벨 | §4.2 | TESTPLAN (runtime/docker), (runtime/jittar). 실제 docker로 수동 확인 | 미착수 |
@@ -96,4 +96,7 @@ podman rm -f t4
 
 ## 남은 결정
 
-없음. 구현 시 기본값으로 정하기로 한 항목(URL 판별 규칙, `${file:}` 공백 제거, 다이제스트 참조 허용, `RunnerSetting{Ephemeral, DisableUpdate}`, 세션 owner 문자열)은 코드 주석에 근거를 남긴다.
+구현 시 기본값으로 정하기로 한 항목(URL 판별 규칙, `${file:}` 공백 제거, 다이제스트 참조 허용, `RunnerSetting{Ephemeral, DisableUpdate}`, 세션 owner 문자열)은 코드 주석에 근거를 남긴다.
+
+- R13 다이제스트 예외의 SPEC 명시 여부 (Phase 2 리뷰 doc-gap). 구현은 유효한 `@sha256:<64 hex>`/`@sha512:<128 hex>` 참조를 태그와 무관하게 허용한다(`internal/config/resolve.go` checkImage). SPEC R13에 한 줄 추가할지 사람이 결정.
+- `scripts/codex-review.ps1`의 node 래퍼가 Codex 완료 후 종료하지 않는 문제 (Phase 2 게이트 매 회차 재현). 완료 후 타임아웃 또는 세션 로그의 `task_complete` 감지가 후속 과제.
