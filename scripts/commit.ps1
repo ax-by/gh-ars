@@ -67,7 +67,8 @@ if ($Override) {
     Write-State $state
     $body = $Message + "`n`nOverride: " + $Override
 }
-$body = $body + "`n`nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+# 모델명은 적지 않는다. 세션마다 달라지고 커밋 기록만 낡는다.
+$body = $body + "`n`nCo-Authored-By: Claude <noreply@anthropic.com>"
 
 if ($Phase -le 3) {
     Write-Host "commit: Phase $Phase 은 사람이 diff 확인 후 직접 커밋한다. 게이트 조건은 충족됨. 실행할 명령:"
