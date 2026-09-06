@@ -144,12 +144,17 @@ scaleSets:
     resources:
 
       # 소수 허용. 예: 0.5
+      # 최소 0.01 (그 아래는 오류. sidecar 모드의 CPUQuota 1% 미만은
+      # systemd에 실제로 적용되지 않는다)
       #
       # Docker 기준:
       #   --cpus=2
+      # sidecar 모드:
+      #   CPUQuota=200%   (cpu × 100. 0.125면 12.5%)
       cpu: 2
 
-      # 단위: Ki, Mi, Gi
+      # 단위: Ki, Mi, Gi. 앞자리는 정수여야 한다
+      # (1.5Gi는 오류. 1536Mi로 쓴다)
       #
       # Docker 기준:
       #   --memory=4g

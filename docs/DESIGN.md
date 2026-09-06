@@ -143,10 +143,10 @@ func ParseMemory(s string) (int64, error)    // "512Mi", "4Gi", "1024Ki" (1024 �
 func ParseBudget(cpu any, memory string) (Budget, error)
 
 func (b Budget) DockerFlags() []string       // ["--cpus=2", "--memory=4294967296"] [§9.3 표]
-func (b Budget) SystemdProps() (cpuQuota, memoryMax string)   // "200%", "4G". memoryMax 는 바이트를 1024로 나누어 떨어지는 가장 큰 단위(K/M/G)로 표기 [§9.3 표]
+func (b Budget) SystemdProps() (cpuQuota, memoryMax string)   // "200%", "4G". cpuQuota 는 cpu×100 을 그대로 쓴 문자열(0.125 → "12.5%"). memoryMax 는 바이트를 1024로 나누어 떨어지는 가장 큰 단위(K/M/G)로 표기 [§9.3 표]
 ```
 
-`domain`은 `resource.Budget`을 `ScaleSet.Unit`과 `Machine` 리소스에 쓴다. `config`는 파싱에 `resource.Parse*`를 호출한다.
+`domain`은 `resource.Budget`을 `ScaleSet.Unit`에 쓴다. 머신 예산은 preflight(§7.1)가 config 또는 `runtime.Info`로 조립해 `PhysicalMax`/`EffectiveMax`를 계산하고, `domain.Machine`에는 그 결과인 정수 두 개만 남는다(재접속 시 preflight를 다시 돌고, `plan.Capacity`는 `EffectiveMax`만 읽는다). `config`는 파싱에 `resource.Parse*`를 호출한다.
 
 ## 4. 인터페이스
 
@@ -266,7 +266,7 @@ package systemd
 
 type Slices interface {
     Check(ctx) error                                                          // systemctl --version (root 아니면 sudo -n). preflight R16
-    Create(ctx, name string, cpuQuotaPercent int, memoryMax string) error  // set-property --runtime
+    Create(ctx, name string, cpuQuota, memoryMax string) error             // set-property --runtime. 인자는 resource.Budget.SystemdProps() 반환값 그대로 (§3.4)
     Remove(ctx, name string) error                                           // stop + revert
     List(ctx, prefix string) ([]string, error)                               // 고아 slice 탐색
 }

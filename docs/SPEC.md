@@ -70,7 +70,7 @@
 | `gh-ars.mode` | `none` \| `sidecar` |
 | `gh-ars.machine` | 머신 이름 (로그용. 소속 머신의 권위는 "SSH로 도달한 현재 머신" 또는 local) |
 
-볼륨에도 같은 라벨을 붙인다. slice 이름은 `gh-ars-<unit>.slice`.
+볼륨에도 같은 라벨을 붙이되 `gh-ars.role`은 제외한다. 볼륨은 runner와 sidecar가 함께 마운트하는 unit 단위 부품이라 role 값이 없다(§9.1). 볼륨 조회는 특정 unit 정리 시 `gh-ars.unit=<unit>`, 머신 전체 동기화 시 `gh-ars.unit` 키 존재로 한다(후자는 고아·Foreign unit을 포함해야 하므로 값이나 scale set으로 거르지 않는다). slice 이름은 `gh-ars-<unit>.slice`.
 
 **이름과 라벨의 역할 분담**: events 스트림에서는 컨테이너 이름 `gh-ars-<unit>-runner|sidecar`(§4.3)로 unit과 role을 식별한다. 이름은 docker/podman 두 runtime의 `die` 이벤트에 항상 포함되기 때문이다. 라벨은 `ps --filter` 조회, 볼륨·slice 대조, 입양 시 scale set/mode 복원에만 쓴다.
 
@@ -110,7 +110,7 @@
 
 ### 6.0 필드 표
 
-타입의 `cpu`는 숫자 또는 문자열(`2`, `0.5`, `"2"`)을 허용하고 내부에서 float으로 정규화한다. `memory`는 `Ki/Mi/Gi` 접미 문자열이다.
+타입의 `cpu`는 숫자 또는 문자열(`2`, `0.5`, `"2"`)을 허용하고 내부에서 float으로 정규화한다. `memory`는 `Ki/Mi/Gi` 접미 문자열이며 앞자리는 양의 정수다(R25).
 
 | 필드 | 타입 | 필수 | 기본값 | 규칙 |
 |---|---|---|---|---|
@@ -234,7 +234,7 @@ machines:
 | R22 | `machines[].maxRunners > physicalMax` → 경고 후 cap |
 | R23 | `scaleSet.maxRunners` 없음 → 오류. `> Σ effectiveMax` → 경고 후 cap |
 | R24 | `minRunners > capacity` → 시작 시 도달한 머신만으로 계산. 전 머신이 도달했는데 위반이면 오류. 미도달 머신이 하나라도 있으면 오류 대신 경고(desired가 `min(capacity, …)`라 동작은 깨지지 않고 warm runner가 덜 뜰 뿐) |
-| R25 | `cpu` 파싱 실패(음수, 0, 숫자 아님) / `memory` 단위 아님(Ki/Mi/Gi) → 오류 |
+| R25 | `cpu` 파싱 실패(음수, 0, 숫자 아님) / `cpu < 0.01`(= `CPUQuota` 1% 미만) / `memory`가 `<양의 정수><Ki\|Mi\|Gi>` 형식이 아님(소수 `1.5Gi`도 오류. `1536Mi`로 쓴다) → 오류. 하한을 두는 이유: 그 아래는 systemd의 `CPUQuotaPerSecUSec` 반올림에 묻혀 slice에 실제로 적용되지 않고, §8.1의 `floor(machine.cpu / unit.cpu)`가 비현실적인 capacity를 낸다. 하한 위에서는 값을 클램프하지 않고 `cpu×100`을 그대로 쓴다(`cpu: 0.125` → `CPUQuota=12.5%`) |
 
 ## 7. 실행 흐름
 
@@ -397,6 +397,7 @@ systemctl revert gh-ars-<unit>.slice                       # set-property 가 �
 |---|---|---|
 | `cpu: 2` | `CPUQuota=200%` | `--cpus=2` |
 | `cpu: 0.5` | `CPUQuota=50%` | `--cpus=0.5` |
+| `cpu: 0.125` | `CPUQuota=12.5%` | `--cpus=0.125` |
 | `memory: 4Gi` | `MemoryMax=4G` | `--memory=<bytes>` |
 | `memory: 512Mi` | `MemoryMax=512M` | `--memory=<bytes>` |
 
