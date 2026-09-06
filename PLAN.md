@@ -8,7 +8,8 @@
 
 - 루프 게이트(`scripts/gate.ps1`, `scripts/commit.ps1`, `.loop/state.json`, 직접 커밋 거부 훅, SessionStart 요약 훅) — 완료 2026-09-06. 이 작업 자체는 게이트를 거치지 않았다.
 - Phase 0 체크리스트 작성 — 완료(아래 절). 결과 수신은 Phase 9(podman) 시작 전까지 필요하다(`podman cp -` 실패 시 SPEC §7.2-4의 "원격 디스크에 남지 않음" 요구가 바뀐다). 0-2(slice)는 Phase 12 전까지.
-- 첫 커밋: `git init`(완료), `.gitignore`, go.mod 의존성(DESIGN §10, actions/scaleset v0.4.0 고정) — 커밋 미착수.
+- 첫 커밋: `git init`, `.gitignore` — 완료(91018ed).
+- go.mod 외부 의존성은 사전 준비가 아니다. **처음 쓰는 Phase에서 그 Phase 커밋에 함께 넣는다**(도입 Phase 표는 DESIGN §10). 그래서 go.mod가 비어 있어도 밀린 작업이 아니다.
 
 ## Phase 표
 
@@ -17,7 +18,7 @@
 | Phase | 범위 | SPEC | DESIGN | 완료 기준 | 상태 |
 |---|---|---|---|---|---|
 | 0 | 스파이크: 미확정 동작 검증 | §7.2-4, §9.3 | – | 아래 절 4항목 결과 기록 | 완료 |
-| 1 | `resource`, `domain` | §4, §8.1, §9.3 표, R25 | §3.1, §3.4 | TESTPLAN (resource), (domain) | 미착수 |
+| 1 | `resource`, `domain` | §4, §8.1, §9.3 표, R25 | §3.1, §3.4 | TESTPLAN (resource), (domain) | 완료 2026-09-06 (게이트 3회차 PASS, findings=0. 커밋 73c497c 문서 / 92a4abc 코드) |
 | 2 | `config` | §6 전체, R2~R15·R17~R20·R23 필수성·R25 | §8 | TESTPLAN (config). `examples/gh-ars.yaml` 로드 성공 | 미착수 |
 | 3 | `plan` | §7.2-3, §8.1~§8.3 | §5, §3.2 집계 정의 | TESTPLAN (plan) | 미착수 |
 | 4 | `executor/local` | §5 Executor, §10.2(local 사용자 권한) | §4.1 | TESTPLAN (executor/local) | 미착수 |

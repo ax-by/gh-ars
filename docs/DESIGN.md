@@ -450,14 +450,16 @@ gh-ars scaleset delete <name> -c <file>
 
 ## 10. 외부 의존성
 
-| 용도 | 패키지 |
-|---|---|
-| Scale Set API | `github.com/actions/scaleset` **v0.4.0**(2026-09-06 기준 최신 태그. go.mod에 고정하고 갱신은 명시적 결정으로만), `.../listener` |
-| SSH | `golang.org/x/crypto/ssh`, `golang.org/x/crypto/ssh/knownhosts` |
-| YAML | `gopkg.in/yaml.v3` |
-| ULID | `github.com/oklog/ulid/v2` |
-| 로그 | 표준 `log/slog` |
-| tar | 표준 `archive/tar` |
+go.mod에는 **처음 쓰는 Phase에서** 그 의존성만 추가한다(`go get <pkg>@<version>` 후 그 Phase 커밋에 go.mod·go.sum을 포함). 쓰지 않는 의존성을 미리 올려두지 않는다: 왜 필요한지가 코드와 같은 커밋에 드러나고, 결국 안 쓰게 된 패키지가 go.mod에 남지 않는다. 버전은 추가하는 시점에 고정하며, 아래 표에 없는 패키지를 넣으려면 먼저 보고하고 이 표에 행을 추가한다.
+
+| 용도 | 패키지 | 도입 Phase |
+|---|---|---|
+| Scale Set API | `github.com/actions/scaleset` **v0.4.0**(2026-09-06 기준 최신 태그. go.mod에 고정하고 갱신은 명시적 결정으로만), `.../listener` | 6 (`github`) |
+| SSH | `golang.org/x/crypto/ssh`, `golang.org/x/crypto/ssh/knownhosts` | 8 (`executor/ssh`) |
+| YAML | `gopkg.in/yaml.v3` | 2 (`config`) |
+| ULID | `github.com/oklog/ulid/v2` | 7 (`controller` — unit id 발급. Phase 1의 `domain`은 형식 검증만 해서 필요 없다) |
+| 로그 | 표준 `log/slog` | – (표준 라이브러리) |
+| tar | 표준 `archive/tar` | – (표준 라이브러리) |
 
 ## 11. 테스트 전략  [TESTPLAN.md]
 
