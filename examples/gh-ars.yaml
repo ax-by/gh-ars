@@ -1,0 +1,464 @@
+# 알 수 없는 키가 있으면 시작 시 오류로 처리한다. (strict decode)
+
+# ─────────────────────────────────────────────────────────────
+# GitHub 연결 설정
+# ─────────────────────────────────────────────────────────────
+#
+# 설정파일 하나는 하나의 Organization 또는 Repository만 대상으로 한다.
+# 여러 org/repo를 운영하려면 설정파일과 gh-ars 프로세스를
+# 각각 별도로 실행한다.
+#
+github:
+
+  # Self-hosted Runner를 등록할 GitHub Organization 또는 Repository URL.
+  #
+  # Organization 예:
+  #   https://github.com/my-org
+  #
+  # Repository 예:
+  #   https://github.com/my-org/my-repo
+  #
+  # URL 형태를 보고 gh-ars가 org/repo scope를 판별한다.
+  # GitHub Enterprise Server는 해당 서버 URL을 그대로 사용한다.
+  url: https://github.com/my-org
+
+  # GitHub API 인증 정보.
+  #
+  # token 또는 app 중 하나만 사용할 수 있다.
+  # 둘 다 설정하면 오류로 처리한다.
+  auth:
+
+    # GitHub Personal Access Token.
+    #
+    # 실제 토큰 값을 YAML에 직접 작성하지 않고
+    # 환경변수 또는 파일 참조 방식으로만 입력한다.
+    token: "${env:GITHUB_PAT}"
+
+    # GitHub App을 사용하는 경우 token 대신 설정한다. (권장)
+    #
+    # app:
+    #   clientId: Iv1.xxxxxxxx
+    #   installationId: 12345678
+    #   privateKey: "${file:~/.config/gh-ars/app.pem}"
+
+# ─────────────────────────────────────────────────────────────
+# Runner Scale Set 설정
+# ─────────────────────────────────────────────────────────────
+#
+# 같은 실행 특성을 가지는 runner들의 논리적인 그룹.
+#
+# 예를 들어 linux-x64 Scale Set에 속한 runner들은
+# 같은 이미지와 CPU/Memory 설정을 사용한다.
+#
+# 각 Scale Set에는 최소 1개 이상의 머신이 연결되어야 한다.
+# 연결된 머신이 없는 Scale Set은 시작 시 오류로 처리한다.
+#
+# jobRuntime.mode가 sidecar인 Scale Set에 연결된 머신들은
+# runtime(docker/podman)이 모두 같아야 한다. (아래 jobRuntime 설명 참고)
+#
+# job의 성격(무게, docker 필요 여부)이 다르면 Scale Set을 나누고
+# 이름으로 드러낸다. 예: linux-x64, linux-x64-dind
+#
+scaleSets:
+
+  # ───────────── linux-x64 ─────────────
+  #
+  # workflow에서 docker를 쓰지 않는 일반 job용.
+  # docker 머신과 podman 머신을 섞어서 연결할 수 있다.
+
+  - # Scale Set의 고유 이름.
+    #
+    # GitHub에 등록되는 Runner Scale Set 이름으로 사용하고,
+    # GitHub Actions workflow에서는 runs-on 값으로 사용한다.
+    #
+    # 예:
+    #
+    # jobs:
+    #   build:
+    #     runs-on: linux-x64
+    #
+    name: linux-x64
+
+    # 이 Scale Set이 속할 GitHub Runner Group.
+    #
+    # Scale Set을 GitHub에 등록할 때 사용한다.
+    # org scope에서는 Runner Group으로 저장소별 접근을 제어할 수 있다.
+    # repo scope에서는 Default만 사용할 수 있으며
+    # 다른 값을 지정하면 오류로 처리한다.
+    #
+    # 기본값: Default
+    runnerGroup: Default
+
+    # 이 Scale Set 전체에서 항상 준비 상태로 유지할
+    # warm/idle runner의 최소 개수.
+    #
+    # 예:
+    # minRunners: 2
+    #
+    # → linux-x64 runner를 전체적으로 2개 준비한다.
+    #
+    # 실제 어느 머신에 배치할지는 gh-ars가 결정한다.
+    #
+    # minRunners > capacity 이면: 시작 시 모든 머신에 도달했을 때는 오류,
+    # 미도달 머신이 있으면 경고만 하고 계속한다. (capacity는 아래 maxRunners 설명 참고)
+    #
+    # 기본값: 0 scale to zero
+    minRunners: 0
+
+    # 이 Scale Set 전체에서 동시에 실행할 수 있는 runner의 최대 개수.
+    #
+    # GitHub에 Scale Set의 최대 용량(maxCapacity)으로 보고되는 값이다.
+    #
+    # 실제 적용되는 값(capacity)은 아래 계산을 따른다.
+    #
+    #   unit            = resources
+    #                     (jobRuntime.mode가 sidecar면 runner + sidecar 합산 예산)
+    #   physicalMax(m)  = floor(min(m.resources.cpu    / unit.cpu,
+    #                               m.resources.memory / unit.memory))
+    #   effectiveMax(m) = min(physicalMax(m), m.maxRunners)   # m.maxRunners는 선택
+    #   capacity        = min(maxRunners, Σ effectiveMax(m))
+    #
+    # maxRunners > Σ effectiveMax(m) 이면 경고 로그를 출력하고
+    # capacity를 Σ effectiveMax(m)로 cap한다.
+    #
+    # 필수.
+    maxRunners: 10
+
+    # runner 한 단위(unit)에 할당할 리소스 예산.
+    #
+    # 컨테이너 리소스 제한과 physicalMax 계산에 같은 값을 사용한다.
+    #
+    # 이 값은 job이 실제로 쓸 리소스의 예측이 아니라
+    # job 하나에 허용하는 상한이다.
+    #   - 예산보다 많이 쓰면 job이 OOM(exit 137)이나 CPU 스로틀로 실패하거나 느려진다.
+    #   - 예산이 크면 physicalMax가 줄어 머신이 논다.
+    # 가장 무거운 job 기준으로 잡고, job 성격이 다르면 Scale Set을 나눈다.
+    #
+    # jobRuntime.mode에 따라 적용 방식이 다르다.
+    #   none:    runner 컨테이너 1개에 직접 limit을 건다. (--cpus, --memory)
+    #   sidecar: runner + sidecar 컨테이너를 같은 cgroup(systemd slice) 아래 두고
+    #            합산해서 적용한다. 어느 컨테이너에서 쓰든 이 예산에서 빠진다.
+    #            그래서 이 값은 runner 아래가 아니라 Scale Set 레벨에 둔다.
+    #
+    # 디스크 I/O, 디스크 용량, 네트워크는 예산에 포함되지 않는다.
+    resources:
+
+      # 소수 허용. 예: 0.5
+      #
+      # Docker 기준:
+      #   --cpus=2
+      cpu: 2
+
+      # 단위: Ki, Mi, Gi
+      #
+      # Docker 기준:
+      #   --memory=4g
+      memory: 4Gi
+
+    # runner 컨테이너 설정.
+    runner:
+
+      # runner 컨테이너를 생성할 때 사용할 이미지.
+      #
+      # 생략하면 gh-ars의 기본 runner 이미지를 사용한다.
+      #
+      # 항상 고정된 버전 태그를 사용한다.
+      # ephemeral runner는 job마다 새로 생성되므로
+      # latest 태그를 사용하면 runner 버전이 예고 없이 바뀔 수 있다.
+      #
+      # gh-ars는 시작 시 각 머신에 이 이미지를 미리 pull한다.
+      # jobRuntime.mode가 sidecar면 sidecar 이미지도 함께 pull한다.
+      #
+      # 기본 이미지는 runner만 들어 있는 최소 이미지다.
+      # Go, JDK, Node 같은 툴체인은 없다. 다음 중 하나로 제공한다.
+      #   - workflow에서 actions/setup-go 같은 setup-* action 사용 (job마다 다운로드)
+      #   - FROM ghcr.io/actions/actions-runner 로 툴체인을 얹은 커스텀 이미지 지정
+      #     (tool cache 레이아웃으로 넣고 RUNNER_TOOL_CACHE를 _work 밖 경로로 지정하면
+      #      setup-* 가 다운로드 없이 바로 사용한다. examples/runner-image 참고)
+      #
+      # 공식 이미지는 docker CLI와 buildx를 포함하므로 sidecar 모드에서
+      # DOCKER_HOST가 그대로 동작한다. 커스텀 이미지를 쓸 때 docker CLI를
+      # 포함하는 것은 사용자 책임이다.
+      #
+      # gh-ars는 entrypoint를 덮어쓰고 JIT config를 create → cp → start 순서로
+      # /home/runner/.jitconfig 파일로 넣는다(원격 디스크에는 남지 않음).
+      # 기본 이미지 기준 실행 명령(none 모드. sidecar 모드는 이 앞에
+      # /var/run/docker.sock 이 생길 때까지 최대 30초 대기하는 루프가 붙는다):
+      #   bash -c 'IFS= read -r ACTIONS_RUNNER_INPUT_JITCONFIG < /home/runner/.jitconfig \
+      #            && rm -f /home/runner/.jitconfig \
+      #            && export ACTIONS_RUNNER_INPUT_JITCONFIG && exec ./run.sh'
+      # 커스텀 이미지도 이 명령이 동작해야 한다.
+      # (bash, workdir /home/runner 와 그 안의 run.sh, runner 사용자의 쓰기 권한.
+      #  sidecar 모드는 [ -S <path> ] 를 지원하는 POSIX sh 면 충분하다)
+      # 공식 이미지를 FROM으로 하면 충족된다.
+      #
+      # :latest 또는 태그 없는 이미지는 시작 시 오류로 처리한다.
+      #
+      # image: ghcr.io/my-org/custom-runner:v1
+      image: ghcr.io/actions/actions-runner:2.337.0
+
+    # workflow에 컨테이너 런타임을 제공할지.
+    #
+    #   none:    제공하지 않음. workflow에서 docker 명령을 쓸 수 없고,
+    #            container: job과 services: 도 실패한다.
+    #            (runner가 이것들을 docker CLI로 띄우기 때문)
+    #            run: 스텝은 runner 컨테이너 안에서 실행된다.
+    #   sidecar: runner 옆에 머신의 runtime과 같은 종류의
+    #            데몬 컨테이너를 --privileged 로 함께 띄운다.
+    #              docker 머신 → dockerd                (docker:dind)
+    #              podman 머신 → podman system service  (quay.io/podman/stable)
+    #            workflow의 docker build / docker run / container: / services:
+    #            는 전부 이 컨테이너 안에서 실행된다.
+    #
+    # sidecar는 runner의 하위 설정이 아니라 옆에 뜨는 별개의 컨테이너이고,
+    # 머신 runtime 동질성·rootful 요구도 Scale Set 전체에 걸리므로
+    # runner와 같은 레벨에 둔다.
+    #
+    # sidecar는 호스트 root와 동등한 권한을 가진다.
+    # CI 전용 머신에만 사용하고, 공용 PC·노트북은 none인 Scale Set에만 연결한다.
+    #
+    # sidecar는 rootful docker 또는 rootful podman이 필요하다.
+    # rootless podman 머신이 연결되어 있으면 시작 시 오류로 처리한다.
+    #
+    # job 단위로 켜고 끌 수 없다. runner는 job 배정 전에 생성되고
+    # GitHub이 idle runner 중 아무 데나 job을 붙이기 때문이다.
+    # docker가 필요한 workflow는 sidecar인 Scale Set을 runs-on으로 지정한다.
+    #
+    # 기본값: none
+    jobRuntime:
+      mode: none
+
+  # ───────────── linux-x64-dind ─────────────
+  #
+  # workflow에서 docker build 등을 쓰는 job용.
+  # 이름에 "job 안에서 docker를 쓸 수 있다"는 능력(dind)을 드러내서
+  # workflow 작성자가 runs-on만 보고 알 수 있게 한다. 이 접미사는 관례일 뿐
+  # 규칙이 아니며, 아래 머신의 runtime(호스트 엔진)과는 다른 축이다.
+  # 연결되는 머신은 전부 rootful docker여야 한다.
+
+  - name: linux-x64-dind
+    runnerGroup: Default
+    minRunners: 0
+    maxRunners: 4
+
+    # runner + sidecar 합산 예산.
+    resources:
+      cpu: 4
+      memory: 8Gi
+
+    runner:
+      image: ghcr.io/actions/actions-runner:2.337.0
+
+    jobRuntime:
+      mode: sidecar
+
+      # 사이드카 컨테이너 이미지. 고정 버전 태그를 사용한다.
+      # :latest 또는 태그 없는 이미지는 시작 시 오류로 처리한다.
+      #
+      # 생략하면 머신 runtime별 기본 이미지를 사용한다.
+      # (기본 태그는 gh-ars 코드 상수이며 릴리스마다 갱신한다)
+      #   docker: docker:29.7.2-dind
+      #   podman: quay.io/podman/stable:v5.8.4
+      #
+      # image: docker:29.7.2-dind
+
+# ─────────────────────────────────────────────────────────────
+# Machine 공통 설정
+# ─────────────────────────────────────────────────────────────
+#
+# machines[]에 등록된 모든 머신에 적용되는 기본값.
+#
+# 개별 machine에 같은 프로퍼티가 있으면
+# 개별 machine 설정이 우선한다.
+#
+machineDefaults:
+
+  # gh-ars가 원격 머신에 접속할 때 사용할 SSH 기본 설정.
+  ssh:
+
+    # SSH 접속 사용자.
+    user: runner
+
+    # SSH 접속 포트.
+    #
+    # 기본값: 22
+    port: 22
+
+    # SSH 인증에 사용할 Private Key 파일.
+    keyFile: ~/.ssh/ci
+
+    # SSH Host Key 검증에 사용할 known_hosts 파일.
+    #
+    # Host Key 검증 순서:
+    #   1. machines[].ssh.fingerprint 가 있으면 그 값과 비교한다.
+    #   2. 없으면 이 파일에서 host의 키를 찾아 비교한다.
+    #   3. 둘 다 없으면 접속을 거부한다.
+    #
+    # gh-ars는 JIT config 같은 secret을 머신에 전달하므로
+    # 검증되지 않은 호스트에는 접속하지 않는다.
+    #
+    # 기본값: ~/.ssh/known_hosts
+    knownHostsFile: ~/.ssh/known_hosts
+
+    # Host Key 검증을 건너뛴다.
+    #
+    # 로컬 테스트 용도로만 사용한다.
+    # true로 설정하면 시작 시 경고 로그를 출력한다.
+    #
+    # 기본값: false
+    insecureSkipHostKeyVerify: false
+
+  # 해당 머신에서 runner 컨테이너를 실행할 Container Runtime.
+  #
+  # 지원 값:
+  #   docker
+  #   podman
+  #
+  # runner 컨테이너를 띄우는 CLI이자,
+  # jobRuntime.mode가 sidecar인 경우 사이드카 엔진도 이 값으로 결정된다.
+  #
+  # podman은 시작 시 rootless 여부를 확인한다.
+  #   podman info --format '{{.Host.Security.Rootless}}'
+  #
+  # 기본값: docker
+  runtime: docker
+
+# ─────────────────────────────────────────────────────────────
+# Runner 실행 머신 설정
+# ─────────────────────────────────────────────────────────────
+#
+# 실제 ephemeral runner 컨테이너가 실행되는 머신.
+#
+# 예:
+#   AWS EC2
+#   Azure VM
+#   GCP VM
+#   OCI VM
+#   사내 서버
+#   일반 PC
+#   노트북
+#
+# host를 지정하면 SSH로 접근한다.
+# host를 생략하면 gh-ars가 실행 중인 머신에서 직접 실행(local executor)하며
+# ssh 설정은 무시된다. host 없는 머신에 ssh 블록이 있으면 오류이고,
+# host 없는 머신은 설정파일당 최대 1개다.
+# 어느 쪽이든 Docker 또는 Podman이 설치되어 있어야 한다.
+#
+# local 머신을 sidecar Scale Set에 연결하면 gh-ars 호스트에서
+# --privileged 컨테이너가 뜬다. 공용 PC·노트북은 none Scale Set에만 연결한다.
+#
+# 최소 1개 이상의 머신이 필요하다.
+#
+machines:
+
+  # ───────────── build-1 ─────────────
+
+  - # 설정 내에서 머신을 식별하는 고유 이름.
+    #
+    # 로그, 컨테이너 label, runner 이름,
+    # Scale Set 연결 등에 사용된다.
+    name: build-1
+
+    # 이 머신이 어느 Scale Set에 속하는지 지정한다.
+    #
+    # 위 scaleSets[].name 값을 참조한다.
+    #
+    # MVP에서는 하나의 머신이 정확히 하나의
+    # Scale Set에만 속하도록 제한한다.
+    scaleSet: linux-x64
+
+    # gh-ars가 SSH로 접속할 hostname 또는 IP 주소. (선택)
+    #
+    # 생략하면 local executor로 gh-ars 호스트에서 직접 실행한다.
+    # ~/.ssh/config 의 alias는 지원하지 않는다.
+    host: 172.18.0.100
+
+    # resources를 생략했으므로 gh-ars가
+    # 시작 시 SSH로 접속해 리소스를 자동 탐지한다.
+    # (build-2의 resources 설명 참고)
+
+  # ───────────── build-2 ─────────────
+
+  - # 머신의 고유 이름.
+    name: build-2
+
+    # 이 머신이 속한 Scale Set.
+    scaleSet: linux-x64
+
+    # SSH 접속 주소.
+    host: 10.0.0.12
+
+    # 이 머신만 별도의 SSH 설정이 필요한 경우 사용한다.
+    #
+    # machineDefaults.ssh를 기본값으로 사용하고
+    # 여기에서 지정한 값만 override한다.
+    ssh:
+
+      # SSH Host Key fingerprint.
+      #
+      # 올바른 SSH 서버에 접속하고 있는지 검증하는 데 사용한다.
+      # 지정하면 knownHostsFile보다 우선한다.
+      fingerprint: "SHA256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+      # SSH Private Key에 passphrase가 설정되어 있는 경우.
+      #
+      # keyPassphrase: "${env:CI_KEY_PASS}"
+
+    # 이 머신만 기본 Container Runtime을 override한다.
+    #
+    # 여기서는 Podman을 사용한다.
+    # linux-x64는 jobRuntime.mode가 none이므로 docker 머신과 섞여도 된다.
+    runtime: podman
+
+    # 이 머신에서 동시에 실행할 runner의 최대 개수.
+    #
+    # physicalMax와 별개로 운영자가 직접 두는 상한이다.
+    # 공용 PC나 노트북처럼 리소스는 충분하지만
+    # runner를 제한적으로만 실행하고 싶은 경우에 사용한다.
+    #
+    #   effectiveMax = min(physicalMax, maxRunners)
+    #
+    # 생략하면 physicalMax를 그대로 사용한다.
+    maxRunners: 2
+
+    # gh-ars가 이 머신에서 runner 용도로
+    # 사용할 수 있다고 판단할 리소스.
+    #
+    # 생략하면 시작 시 SSH로 접속해 Container Runtime에서 자동 탐지한다.
+    #
+    #   docker: docker info --format '{{.NCPU}} {{.MemTotal}}'
+    #   podman: podman info --format '{{.Host.CPUs}} {{.Host.MemTotal}}'
+    #
+    # 명시하면 탐지값과 무관하게 이 값을 상한으로 사용한다.
+    #
+    # 예를 들어 실제 머신이 16 CPU여도
+    #
+    #   cpu: 4
+    #
+    # 로 설정하면 gh-ars는
+    # runner가 사용할 수 있는 CPU를 4로 제한해서 계산한다.
+    #
+    # 탐지값보다 큰 값을 지정하면 경고 로그를 출력하고 탐지값으로 cap한다.
+    #
+    # cpu 또는 memory가 scaleSets[].resources보다 작으면
+    # physicalMax가 0이 되므로 설정 오류로 처리한다.
+    resources:
+
+      # runner 용도로 사용할 수 있는 총 CPU.
+      cpu: 4
+
+      # runner 용도로 사용할 수 있는 총 Memory.
+      memory: 8Gi
+
+  # ───────────── build-3 ─────────────
+  #
+  # sidecar Scale Set에 연결된 CI 전용 머신.
+  # linux-x64-dind의 머신은 전부 rootful docker여야 한다.
+
+  - name: build-3
+    scaleSet: linux-x64-dind
+    host: 10.0.0.13
+    runtime: docker
+    resources:
+      cpu: 16
+      memory: 32Gi

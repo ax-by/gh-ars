@@ -1,0 +1,23 @@
+﻿.codex-review/
+
+.loop/
+
+# IDE (GoLand/JetBrains)
+.idea/
+
+# Claude Code 로컬 개인 설정
+.claude/settings.local.json
+
+# Go 빌드 산출물
+/bin/
+*.exe
+*.test
+*.out
+
+# 비밀/환경 파일
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
