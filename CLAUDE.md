@@ -16,17 +16,24 @@ K8s 없이 정적 머신(SSH 또는 local) 위에서 docker/podman 컨테이너�
 
 ## 환경
 
-- Go는 PATH에 없다. `scripts/go.ps1`이 `C:\Users\user\sdk\go1.27.0\bin\go.exe`를 감싼다. 아래의 `go`는 이 래퍼를 뜻한다. `jq` 없음.
-- 개발 머신은 Windows, 실행 대상은 Linux 머신이다. 기본 셸은 **PowerShell 5.1**이다(`&&`, `||`, `2>/dev/null` 없음. pwsh 7 없음). bash 문법이 필요하면 Git Bash를 명시적으로 쓴다. 이 리포의 개발 머신용 스크립트(`scripts/*.ps1`, `scripts/hooks/*.ps1`)는 전부 PowerShell로 통일한다.
-- 빌드·테스트·게이트:
+- 개발 머신은 Windows 또는 Mac, 실행 대상은 Linux 머신이다. 각 머신은 자기 네이티브 셸을 쓴다: Windows는 **PowerShell 5.1**(`&&`, `||`, `2>/dev/null` 없음. pwsh 7 없음. bash 문법이 필요하면 Git Bash를 명시적으로 씀), Mac은 **bash**(macOS 기본 3.2 기준, `&&`/`||`/`2>/dev/null` 정상 동작). 이 리포의 개발 머신용 스크립트는 `scripts/*.ps1` + `scripts/*.sh`, `scripts/hooks/*.ps1` + `scripts/hooks/*.sh` OS별 쌍으로 존재하며 로직은 1:1로 동일하다. `jq` 없음(Mac 쪽도 node로 JSON 처리해 통일).
+- go 래퍼: Windows는 `scripts/go.ps1`이 `C:\Users\user\sdk\go1.27.0\bin\go.exe`를 감싼다. Mac은 `scripts/go.sh`가 PATH의 go(Homebrew)를 그대로 쓴다. 아래의 `go`는 이 래퍼를 뜻한다.
+- 빌드·테스트·게이트 (Windows):
   ```
   .\scripts\go.ps1 build ./...
   .\scripts\gate.ps1 -Phase N -Packages "internal/x" -Spec "S8.1" -Design "S5" -Base HEAD -TestOnly  # test + vet 만
   .\scripts\gate.ps1 -Phase N -Packages "internal/x" -Spec "S8.1" -Design "S5" -Base HEAD            # + Codex 리뷰, state 기록
   .\scripts\commit.ps1 -Phase N -Message "<type>(<pkg>): ... (Phase N, SPEC §n)"                   # 게이트 통과 시에만
   ```
-  절 번호 인자는 `§` 대신 ASCII `S`로 쓴다(`S8.1` = §8.1. 콘솔 코드페이지 때문). 게이트 상태는 `.loop/state.json`(gitignore)에 남는다.
-- `.go` 편집 시 gofmt/vet 훅(`scripts/hooks/go-check.ps1`, `.claude/settings.json`에서 exec 형식으로 `powershell.exe` 직접 실행)이 자동으로 돈다. 훅 실패는 즉시 고친다.
+  Mac은 동일한 인자를 long option으로:
+  ```
+  ./scripts/go.sh build ./...
+  ./scripts/gate.sh --phase N --packages "internal/x" --spec "S8.1" --design "S5" --base HEAD --test-only
+  ./scripts/gate.sh --phase N --packages "internal/x" --spec "S8.1" --design "S5" --base HEAD
+  ./scripts/commit.sh --phase N --message "<type>(<pkg>): ... (Phase N, SPEC §n)"
+  ```
+  절 번호 인자는 `§` 대신 ASCII `S`로 쓴다(`S8.1` = §8.1. Windows 콘솔 코드페이지 문제로 시작된 관례지만, 두 머신에서 동일한 호출 문법을 쓰기 위해 Mac 쪽에도 그대로 유지). 게이트 상태는 `.loop/state.json`(gitignore)에 남는다.
+- `.go` 편집 시 gofmt/vet 훅이 자동으로 돈다. Windows는 `.claude/settings.json`에서 `scripts/hooks/go-check.ps1`을 `powershell.exe`로 직접 실행. Mac은 `.claude/settings.local.json`(gitignore, 개인 설정)에서 `scripts/hooks/go-check.sh`를 `bash`로 실행 — 팀 공유 `settings.json`은 건드리지 않는다. 훅 실패는 즉시 고친다.
 - Linux 전용 테스트(`executor/local` 실제 프로세스, 실제 docker)는 `//go:build linux` 태그로 분리한다. 유닛 테스트는 fake Executor·fake GitHub로 OS 무관하게 돌아야 한다. Linux 검증은 당장은 WSL2/VM에서 하고, CI(ubuntu)는 후속 과제다.
 
 ## 작업 루프
