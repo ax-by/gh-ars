@@ -255,7 +255,7 @@ func NewDocker(ex executor.Executor, sudo bool) Runtime   // sudo 는 §10.2 판
 func NewPodman(ex executor.Executor, sudo bool) Runtime
 ```
 
-docker/podman 구현은 argv 조립과 출력 파싱(`--format '{{json .}}'`)만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`.
+docker/podman 구현은 argv 조립과 출력 파싱만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`. `events`·`info`는 `--format '{{json .}}'`를 파싱한다. `ps`는 `{{json .}}`를 쓰지 않는다: 그 출력의 `Labels`는 "k=v,k=v"를 이스케이프 없이 이어붙인 문자열이라 이미지가 물려준 라벨 값에 `,gh-ars.mode=none` 같은 조각이 있으면 실제 라벨을 덮어쓸 수 있다. 대신 `{{.Names}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label "gh-ars.unit"}}…` 처럼 §4.2의 gh-ars.* 키 5개를 하나씩 뽑는 탭 구분 템플릿을 쓰고, `Container.Labels`에는 그 키만 담는다(입양 복원에 그것만 필요하다). 비0 종료는 `*ExitError{Argv, ExitCode, Stderr}`로 올리고, `Remove`/`VolumeRemove`는 "이미 없음" 응답을 성공으로 흡수한다(§8.3 멱등).
 
 **sidecar 컨테이너 CreateSpec 값** [§9.1]:
 
@@ -274,7 +274,7 @@ runner 컨테이너(sidecar 모드)는 같은 볼륨 3개, `CgroupParent` 동일
 
 **JIT tar** (`internal/runtime/jittar.go`) [§7.2-4, TESTPLAN §1]: 엔트리 1개 `.jitconfig`, mode 0600, uid/gid 1001, 내용 = EncodedJITConfig + `\n`. `CopyIn(ctx, runnerCtr, tar, "/home/runner")`. 유닛 테스트 대상.
 
-**entrypoint 래퍼** (`internal/runtime/wrapper.go`) [§7.2-4]: `Wrapper(mode domain.Mode) []string`이 `Entrypoint=["/bin/bash"]`, `Cmd=["-c", <script>]`를 돌려준다. script는 SPEC §7.2-4의 none/sidecar 문자열을 그대로 상수로 둔다(sidecar는 소켓 대기 150×0.2s 선행). 유닛 테스트는 두 상수가 SPEC 문자열과 일치하는지 검사한다.
+**entrypoint 래퍼** (`internal/runtime/wrapper.go`) [§7.2-4]: `Wrapper(mode domain.Mode) (entrypoint, cmd []string, err error)`가 `Entrypoint=["/bin/bash"]`, `Cmd=["-c", <script>]`를 돌려주고, 알 수 없는 mode는 오류다. script는 SPEC §7.2-4의 none/sidecar 문자열을 그대로 상수로 둔다(sidecar는 소켓 대기 150×0.2s 선행). 유닛 테스트는 두 상수가 SPEC 문자열과 일치하는지 검사한다.
 
 ### 4.3 systemd  [§9.3, §10.2]
 
