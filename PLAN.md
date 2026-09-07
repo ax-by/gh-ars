@@ -20,7 +20,7 @@
 | 0 | 스파이크: 미확정 동작 검증 | §7.2-4, §9.3 | – | 아래 절 4항목 결과 기록 | 완료 |
 | 1 | `resource`, `domain` | §4, §8.1, §9.3 표, R25 | §3.1, §3.4 | TESTPLAN (resource), (domain) | 완료 2026-09-06 (게이트 3회차 PASS, findings=0. 커밋 73c497c 문서 / 92a4abc 코드) |
 | 2 | `config` | §6 전체, R2~R15·R17~R20·R23 필수성·R25 | §8 | TESTPLAN (config). `examples/gh-ars.yaml` 로드 성공 | 완료 2026-09-06 (게이트 4회차 PASS, findings=1 doc-gap만 잔존. 커밋 06f4baf. yaml.v3 도입) |
-| 3 | `plan` | §7.2-3, §8.1~§8.3 | §5, §3.2 집계 정의 | TESTPLAN (plan) | 미착수 |
+| 3 | `plan` | §7.2-3, §8.1~§8.3 | §5, §3.2 집계 정의 | TESTPLAN (plan) | 완료 2026-09-07 (게이트 2회차 PASS, 지적 반영·문서 동기화로 4회 더 실행해 최종 findings=0. 커밋 2795e2e 문서 / bcd81fa 코드. `plan`이 타입으로 참조하는 `runtime.Container`만 선행 추가) |
 | 4 | `executor/local` | §5 Executor, §10.2(local 사용자 권한) | §4.1 | TESTPLAN (executor/local) | 미착수 |
 | 5 | `runtime/docker` + `jittar` | §7.2-4 none 래퍼·tar, §9.1 볼륨·라벨, §4.2 라벨 | §4.2 | TESTPLAN (runtime/docker), (runtime/jittar). 실제 docker로 수동 확인 | 미착수 |
 | 6 | `github` | §7.1-5, §7.2-1·2·4, §8.3 등록 처리, §11, R7 | §4.4, §4.5 | TESTPLAN (github). 실제 repo에 ensure/JIT/GetRunner/RemoveRunner/delete 수동 확인 | 미착수 |
