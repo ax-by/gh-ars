@@ -106,12 +106,20 @@ if ($updated) {
 $msgFile = Join-Path $repo ".loop\commit-msg.txt"
 [System.IO.File]::WriteAllText($msgFile, $body, (Get-Utf8NoBom))
 $env:GH_ARS_LOOP_COMMIT = "1"
+# Native git stderr (e.g. the CRLF warning) must not become a terminating error under
+# $ErrorActionPreference = "Stop" (PS 5.1): when this script runs inside a PowerShell host that
+# redirects stderr, the first warning would abort between `git add` and `git commit`, leaving a
+# staged-but-uncommitted tree. Merge stderr into the output and judge by exit code only, as
+# loop-common.ps1 / gate.ps1 already do.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 try {
-    & git add -A
+    & git add -A 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -notmatch '^warning: .*(LF|CRLF)' } | Write-Host
     if ($LASTEXITCODE -ne 0) { throw "git add failed ($LASTEXITCODE)" }
-    & git commit -F $msgFile
+    & git commit -F $msgFile 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ -notmatch '^warning: .*(LF|CRLF)' } | Write-Host
     if ($LASTEXITCODE -ne 0) { throw "git commit failed ($LASTEXITCODE)" }
 } finally {
+    $ErrorActionPreference = $prevEap
     Remove-Item -Force $msgFile -ErrorAction SilentlyContinue
     Remove-Item Env:GH_ARS_LOOP_COMMIT -ErrorAction SilentlyContinue
 }
