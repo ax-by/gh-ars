@@ -87,7 +87,7 @@ podman rm -f t4
 
 | # | 시나리오 | 결과 | 일자 / 비고 |
 |---|---|---|---|
-| gh | Phase 6: 실제 repo에 ensure/JIT/GetRunner/RemoveRunner/session/delete. `$env:GH_ARS_MANUAL_URL`·`GH_ARS_MANUAL_TOKEN` 설정 후 `.\scripts\go.ps1 test -tags manual -run TestManual -v ./internal/github` | 미실행 | |
+| gh | Phase 6: 실제 repo에 ensure/JIT/GetRunner/RemoveRunner/session/delete. `$env:GH_ARS_MANUAL_URL`·`GH_ARS_MANUAL_TOKEN` 설정 후 `.\scripts\go.ps1 test -tags manual -run TestManual -v ./internal/github` | 통과 | 2026-09-07, repo `ax-by/test`, PAT(`repo` scope). 로그: scale set 생성(id=1) → 재사용(같은 id) → JIT(runnerID=22, len=4208, 값 미출력) → GetRunner found → RemoveRunner → not found → 재호출 nil → 세션 생성·Close → delete → 재삭제 `ErrScaleSetNotFound`. PASS 9.31s. 사후 `gh api .../actions/runners`에 `gh-ars-manual-*` 등록 없음 |
 | lite | Phase 7: local docker 머신 1대, none 모드 job 1개 완주 | 미실행 | |
 | 1 | none 모드 3대 spread + JIT 미노출 + 정리 순서 | 미실행 | |
 | 2 | sidecar docker/podman, docker build·container:·services: | 미실행 | |
