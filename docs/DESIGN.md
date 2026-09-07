@@ -167,8 +167,13 @@ type Result struct {
 }
 
 type Executor interface {
+    // 프로세스가 실행되어 종료 코드를 남겼으면 오류가 아니라 Result.ExitCode 로 돌려준다.
+    // 오류는 프로세스를 시작하지 못한 경우와 ctx 취소뿐이다.
     Run(ctx context.Context, c Cmd) (Result, error)
     // 장기 스트림. 반환 ReadCloser 가 닫히면(원격 종료·단절) 호출자가 백오프로 재시작한다.
+    // 정상 종료는 io.EOF, 비정상 종료는 argv 와 stderr 를 담은 오류로 마지막 Read 가 알린다.
+    // 호출자는 다 쓰면 Close 한다. 프로세스 회수는 ctx 취소만으로도 되지만, Close 는
+    // ctx 와 무관하게 스트림을 끝내고 파이프·goroutine 정리를 기다리는 유일한 방법이다.
     Stream(ctx context.Context, c Cmd) (io.ReadCloser, error)
     Close() error
 }
@@ -176,6 +181,18 @@ type Executor interface {
 func NewLocal() Executor
 func NewSSH(cfg SSHConfig) (Executor, error)   // 연결 유지, host key 검증(fingerprint → known_hosts → 거부)
 ```
+
+**비0 종료는 오류가 아니라 값이다.** 종료 코드로 분기하는 호출자가 있기 때문이다: preflight 의 podman 경로 고정(§10.2 규칙 3)은 `podman info` 실패를 보고 `sudo -n podman info` 로 넘어가고, 정리 단계(§8.3)는 "이미 없음"을 성공으로 취급한다. 오류를 받아야 하는 실패(바이너리 없음, 접속 끊김, 취소)와 명령의 정상적인 부정 응답을 호출자가 매번 풀어보지 않고 구분하게 한다.
+
+**파이프 대기에는 상한이 있다.** 파이프는 자식의 fd 를 물려받은 손자가 살아 있는 동안 열려 있어, 자식이 죽어도 EOF 가 오지 않을 수 있다(`sudo -n podman info` 가 이 모양이다). 상한이 없으면 `Run` 과 스트림의 `Read`·`Close` 가 손자의 수명만큼 매달려, 기동 타임아웃 2분(§7.2-4)이 지나도 `startUnit` goroutine 이 풀리지 않고 events 재시작(§7.1-8)도 영영 일어나지 않는다. 그래서 자식이 끝난 뒤 파이프가 닫히기를 기다리는 시간을 상한(코드 상수)으로 막는다.
+
+이 상한이 스트림에서도 실제로 걸리려면 `Wait` 이 `Read` 와 나란히 돌아야 한다. `StdoutPipe` 는 파이프를 닫는 주체가 `Wait` 이라 "다 읽은 뒤 `Wait`" 순서를 요구하는데, 손자가 stdout 을 물고 있으면 `Read` 가 끝나지 않아 `Wait` 이 시작되지도 못하고 상한이 발동할 기회가 없다. 그래서 스트림은 `io.Pipe` 를 `cmd.Stdout` 으로 주고 `Wait` 을 곧바로 돌린 뒤, 그 결과를 파이프에 실어 `Read` 의 종료 통지로 만든다.
+
+**stdin 복사도 `exec` 에 맡기지 않는다.** `Cmd.Stdin` 을 그대로 넘기면 `exec` 가 복사 goroutine 을 세우고 `Wait` 이 그것을 기다리는데, 그 goroutine 이 `Read` 에 막혀 있으면 `WaitDelay` 가 목적지 파이프를 닫아도 풀리지 않는다. 상한이 stdin 경로에서만 조용히 무효가 되는 것이다. `*os.File` 을 주면 `exec` 는 fd 를 그대로 넘기고 복사하지 않으므로, 막히는 쪽은 우리 goroutine 뿐이고 `Run` 과 `Close` 는 상한을 지킨다. 대신 호출자는 **즉시 반환하는 Reader** 를 준다 — §7.2-4 의 tar 스트림은 메모리에서 만들므로 이 조건을 만족한다.
+
+이 상한은 ctx 취소뿐 아니라 **자식의 정상 종료에서도 시작한다**(`os/exec` 의 `WaitDelay` 계약). 손자가 없으면 자식 종료와 함께 파이프가 닫혀 발동하지 않지만, 발동했다면 출력이 잘렸을 수 있다. 그때 종료 코드 0을 성공 값으로 돌려주면 `docker ps` 결과가 조용히 잘려 §8.3 판정이 틀어지므로, `Run` 은 그것을 값이 아니라 오류로 알린다.
+
+**예외 하나**: 자식이 비0으로 끝나면 `os/exec` 가 `ExitError` 를 우선해 드레인 만료가 가려지고, 잘렸을 수 있는 출력이 `Result` 로 나간다. 비0 응답에서 stdout 을 신뢰하는 호출자가 없어(§10.2 규칙 3은 성패만, §8.3은 "이미 없음"만 본다) 허용한다.
 
 `SSHConfig`: Host, Port, User, KeyFile, KeyPassphrase, Fingerprint, KnownHostsFile, InsecureSkipHostKeyVerify, ConnectTimeout(10s 상수). 구현 라이브러리: `golang.org/x/crypto/ssh` + `knownhosts`.
 
