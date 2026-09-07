@@ -30,7 +30,7 @@ internal/controller/        Controller: 상태 소유 goroutine, listener.Scaler
 internal/logging/           slog 설정 (--log-level, --log-format)                                       [§11]
 ```
 
-의존 방향: `cmd → {controller, config, logging}`, `controller → {github, machine, plan, domain}`, `config → {domain, resource}`, `plan → {domain, resource, runtime(타입만)}`, `domain → resource`, `machine → {runtime, systemd, executor}`, `runtime → executor`. `plan`, `domain`, `resource`는 I/O를 수행하지 않는다(`plan`이 `runtime.Container` 타입을 참조하는 것은 허용, 함수 호출은 금지).
+의존 방향: `cmd → {controller, config, logging}`, `controller → {github, machine, plan, domain}`, `config → {domain, resource}`, `plan → {domain, resource, runtime(타입만)}`, `domain → resource`, `machine → {runtime, systemd, executor}`, `runtime → {executor, domain}`. `plan`, `domain`, `resource`는 I/O를 수행하지 않는다(`plan`이 `runtime.Container` 타입을 참조하는 것은 허용, 함수 호출은 금지).
 
 ## 3. 도메인 모델
 

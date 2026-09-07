@@ -56,7 +56,7 @@ E2E(`docs/TESTPLAN.md` §2)는 실제 머신과 GitHub repo가 필요하므로 �
 
 - 테스트 이름에 SPEC 규칙/절 번호: `TestValidate_R15_SidecarRuntimeMismatch`, `TestReconcile_S8_3_ExitedRunner`.
 - 코드 주석에 `[§n]` 참조. 규칙을 구현하는 함수에는 반드시.
-- 의존 방향: `cmd → {controller, config, logging}`, `controller → {github, machine, plan, domain}`, `config → {domain, resource}`, `plan → {domain, resource}`, `domain → resource`, `machine → {runtime, systemd, executor}`, `runtime → executor`. `plan`·`domain`·`resource`는 I/O를 하지 않는다. 전체 목록은 DESIGN §2.
+- 의존 방향: `cmd → {controller, config, logging}`, `controller → {github, machine, plan, domain}`, `config → {domain, resource}`, `plan → {domain, resource}`, `domain → resource`, `machine → {runtime, systemd, executor}`, `runtime → {executor, domain}`. `plan`·`domain`·`resource`는 I/O를 하지 않는다. 전체 목록은 DESIGN §2.
 - 상태는 Controller goroutine만 만진다. 느린 작업은 goroutine으로 빼고 결과를 inbox 메시지로 돌려보낸다. 락으로 우회하지 않는다.
 - 상수(grace 5m, 기동 타임아웃 2m, SSH 접속 10s, tick 30s, 백오프 1s→30s)는 SPEC §8.3 표와 §7.1-8을 따르고 한 곳에 모은다. 설정으로 노출하지 않는다.
 - 새 외부 의존성은 DESIGN §10 표에 있는 것만. 추가가 필요하면 먼저 보고한다.
