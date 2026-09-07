@@ -76,4 +76,51 @@ ARGS+=("$INSTRUCTION")
 
 echo "codex-review: phase=$PHASE packages=$PACKAGES base=$BASE model=$MODEL effort=$EFFORT"
 cd "$REPO"
-exec node "$COMPANION" "${ARGS[@]}"
+# Mirrors codex-review.ps1: the companion prints the rendered result only after `codex app-server`
+# exits. When the review used tools, codex leaves code-mode host / node_repl grandchildren holding the
+# app-server pipes, so the companion can wait forever. Run node in the background, watch stderr for the
+# completion line, and if node is still alive after a grace period, kill its descendants (deepest
+# first). The app-server's exit unblocks the companion, which flushes the result and exits by itself.
+OUT_DIR="$REPO/.codex-review"
+STDOUT_PATH="$OUT_DIR/companion.stdout.txt"
+STDERR_PATH="$OUT_DIR/companion.stderr.txt"
+rm -f "$STDOUT_PATH" "$STDERR_PATH"
+node "$COMPANION" "${ARGS[@]}" >"$STDOUT_PATH" 2>"$STDERR_PATH" &
+NODE_PID=$!
+
+COMPLETION_MARKER="Turn completion inferred"
+GRACE_AFTER_DONE=30
+HARD_LIMIT=$((45 * 60))
+DONE_AT=""
+STARTED=$(date +%s)
+KILLED_TREE=0
+
+descendant_pids() {   # deepest first
+    local p
+    for p in $(pgrep -P "$1" 2>/dev/null); do
+        descendant_pids "$p"
+        echo "$p"
+    done
+}
+
+while kill -0 "$NODE_PID" 2>/dev/null; do
+    sleep 2
+    NOW=$(date +%s)
+    if [ -z "$DONE_AT" ] && grep -q "$COMPLETION_MARKER" "$STDERR_PATH" 2>/dev/null; then DONE_AT=$NOW; fi
+    OVER_GRACE=0; OVER_LIMIT=0
+    [ -n "$DONE_AT" ] && [ $((NOW - DONE_AT)) -ge "$GRACE_AFTER_DONE" ] && OVER_GRACE=1
+    [ $((NOW - STARTED)) -ge "$HARD_LIMIT" ] && OVER_LIMIT=1
+    if { [ "$OVER_GRACE" -eq 1 ] || [ "$OVER_LIMIT" -eq 1 ]; } && [ "$KILLED_TREE" -eq 0 ]; then
+        KILLED_TREE=1
+        DESC=$(descendant_pids "$NODE_PID")
+        if [ "$OVER_LIMIT" -eq 1 ]; then WHY="hard limit"; else WHY="after completion"; fi
+        echo "codex-review: companion did not exit ($WHY); terminating $(echo "$DESC" | grep -c .) descendant process(es)"
+        for d in $DESC; do kill -9 "$d" 2>/dev/null; done
+        for _ in $(seq 1 15); do kill -0 "$NODE_PID" 2>/dev/null || break; sleep 2; done
+        kill -0 "$NODE_PID" 2>/dev/null && kill -9 "$NODE_PID" 2>/dev/null
+    fi
+done
+wait "$NODE_PID"; NODE_RC=$?
+[ -f "$STDOUT_PATH" ] && cat "$STDOUT_PATH"
+[ -f "$STDERR_PATH" ] && cat "$STDERR_PATH"
+exit $NODE_RC

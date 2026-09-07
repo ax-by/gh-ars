@@ -23,7 +23,7 @@
 | 3 | `plan` | §7.2-3, §8.1~§8.3 | §5, §3.2 집계 정의 | TESTPLAN (plan) | 완료 2026-09-07 (게이트 2회차 PASS, 지적 반영·문서 동기화로 4회 더 실행해 최종 findings=0. 커밋 2795e2e 문서 / bcd81fa 코드. `plan`이 타입으로 참조하는 `runtime.Container`만 선행 추가) |
 | 4 | `executor/local` | §5 Executor, §10.2(local 사용자 권한) | §4.1 | TESTPLAN (executor/local) | 완료 2026-09-07 |
 | 5 | `runtime/docker` + `jittar` | §7.2-4 none 래퍼·tar, §9.1 볼륨·라벨, §4.2 라벨 | §4.2 | TESTPLAN (runtime/docker), (runtime/jittar). 실제 docker로 수동 확인 | 완료 2026-09-07 |
-| 6 | `github` | §7.1-5, §7.2-1·2·4, §8.3 등록 처리, §11, R7 | §4.4, §4.5 | TESTPLAN (github). 실제 repo에 ensure/JIT/GetRunner/RemoveRunner/delete 수동 확인 | 미착수 |
+| 6 | `github` | §7.1-5, §7.2-1·2·4, §8.3 등록 처리, §11, R7 | §4.4, §4.5 | TESTPLAN (github). 실제 repo에 ensure/JIT/GetRunner/RemoveRunner/delete 수동 확인 | 완료 2026-09-07 |
 | 7 | `controller` 최소(none, local, docker) + `cmd` — walking skeleton | §7 전체(none·local 범위), §8.3 정리 순서, §11 | §6, §9, §4.5 | TESTPLAN (controller/core). E2E-lite: 실제 repo에서 job 1개 완주(사람 실행) | 미착수 |
 | 8 | `executor/ssh` | §10.1, R20 | §4.1 | TESTPLAN (executor/ssh) | 미착수 |
 | 9 | `runtime/podman` | §9.2 podman info 형식, §10.2 규칙 3 경로 | §4.2 | TESTPLAN (runtime/podman). Phase 0-3 결과 필요 | 미착수 |
@@ -87,6 +87,7 @@ podman rm -f t4
 
 | # | 시나리오 | 결과 | 일자 / 비고 |
 |---|---|---|---|
+| gh | Phase 6: 실제 repo에 ensure/JIT/GetRunner/RemoveRunner/session/delete. `$env:GH_ARS_MANUAL_URL`·`GH_ARS_MANUAL_TOKEN` 설정 후 `.\scripts\go.ps1 test -tags manual -run TestManual -v ./internal/github` | 미실행 | |
 | lite | Phase 7: local docker 머신 1대, none 모드 job 1개 완주 | 미실행 | |
 | 1 | none 모드 3대 spread + JIT 미노출 + 정리 순서 | 미실행 | |
 | 2 | sidecar docker/podman, docker build·container:·services: | 미실행 | |
@@ -99,4 +100,4 @@ podman rm -f t4
 구현 시 기본값으로 정하기로 한 항목(URL 판별 규칙, `${file:}` 공백 제거, 다이제스트 참조 허용, `RunnerSetting{Ephemeral, DisableUpdate}`, 세션 owner 문자열)은 코드 주석에 근거를 남긴다.
 
 - R13 다이제스트 예외의 SPEC 명시 여부 (Phase 2 리뷰 doc-gap). 구현은 유효한 `@sha256:<64 hex>`/`@sha512:<128 hex>` 참조를 태그와 무관하게 허용한다(`internal/config/resolve.go` checkImage). SPEC R13에 한 줄 추가할지 사람이 결정.
-- `scripts/codex-review.ps1`의 node 래퍼가 Codex 완료 후 종료하지 않는 문제 (Phase 2 게이트 매 회차 재현). 완료 후 타임아웃 또는 세션 로그의 `task_complete` 감지가 후속 과제.
+- ~~`scripts/codex-review.ps1`의 node 래퍼가 Codex 완료 후 종료하지 않는 문제~~ — 원인·수정 2026-09-07 (Phase 6). 리뷰가 도구를 쓰면 codex가 `codex-code-mode-host`·`node_repl` 손자를 남기고 이들이 app-server 파이프를 물어 companion의 `await exitPromise`가 풀리지 않았다. 래퍼가 stderr의 완료 줄을 감지하고 30초 뒤에도 살아 있으면 node 아래 후손을 종료한다(`.sh`도 1:1). 같은 원인으로 Codex 플러그인의 Stop 훅 리뷰도 고아 트리를 남길 수 있다(`/codex:setup`의 stop-time review gate 토글).

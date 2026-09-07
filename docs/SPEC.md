@@ -258,13 +258,17 @@ machines:
 
 ### 7.2 루프
 1. `GetMessage(maxCapacity = 현재 capacity)`. capacity는 **동적**: unhealthy 머신은 제외되어 다음 폴링부터 유입이 줄어든다.
+   메시지 수신·파싱 직후 라이브러리가 `DeleteMessage`로 ack한다(2번 이후의 핸들러 실행 전). 처리 중 크래시로 메시지를 잃어도, acquire된 job은 GitHub 큐에 남고 다음 메시지의 `TotalAssignedJobs`가 desired를 재계산하므로 복구된다(level-triggered).
 2. `JobAvailable` 수신 → 용량 안에서만 도착하므로 전부 `AcquireJobs`.
 3. desired 계산과 생성:
    ```
-   desired = min(capacity, max(minRunners, TotalAssignedJobs))
-   create  = desired − running
+   assigned = max(0, TotalAssignedJobs − |pendingCompletion|)
+   desired  = min(capacity, max(minRunners, assigned))
+   create   = desired − running
    ```
    `running`은 job을 받을 수 있거나 곧 받을 unit 수다: **Creating(기동 중) + Starting(등록 전) + Running + Draining**. Dying은 포함하지 않는다(단, 머신 slot 점유에는 포함. §8.3).
+
+   `pendingCompletion`은 job을 받았던(busy) unit이 `die`했지만 그 runner의 `JobCompleted`가 아직 도착하지 않은 runner 이름의 집합이다. listener는 빈 폴링(long-poll 만료)에도 직전 메시지의 `TotalAssignedJobs`를 캐시해 같은 값으로 desired 콜백을 부르므로, 통계가 아직 반영하지 않은 완료분을 이 집합으로 뺀다 — 그래서 빈 폴링에서 유휴 runner가 생기지 않는다. `die`와 `JobCompleted`는 어느 쪽이 먼저 와도 된다: `JobCompleted`가 먼저 오면 unit에 완료 표시만 남기고 그 unit의 `die`는 집합에 넣지 않으며, `die`가 먼저 왔으면 뒤따르는 `JobCompleted`가 집합에서 뺀다(이름 키라 중복 콜백에 멱등). 같은 메시지 안에서는 라이브러리가 `JobCompleted` 핸들러를 desired 콜백보다 먼저 부르므로, 통계가 줄어드는 메시지에서 집합도 함께 비워진다. 안전장치(주 메커니즘이 아니라 안전망): (1) 메시지 세션 재시작 시 집합을 비운다(초기 세션 통계가 새 기준선). 전체 동기화(§7.1-7)에서는 그 머신 소속 unit의 항목을 비운다. (2) 항목은 5분(§8.3 상수 표)이 지나면 버린다. 잔여 실패 모드는 일시적 1개 과소 배치이며 다음 `JobCompleted` 또는 만료에서 자가 치유된다.
    `create > 0`이면 그 수만큼: spread로 머신 선택 → unit id 발급 → `GenerateJitRunnerConfig(name=<scaleSet>-<machine>-<unit>)` → 컨테이너 실행.
    후보 머신 없음 → pending 유지. job은 GitHub 큐에서 대기(최대 24h). gh-ars는 취소하지 않는다.
 
@@ -273,7 +277,7 @@ machines:
    remove = running − desired
    ```
    `remove > 0`이면 그 수만큼 후보를 고른다. 후보는 **Running이고 `JobStarted`로 busy 표시가 없는 unit, 오래된 순**. Creating/Starting/Draining/Dying은 건드리지 않는다(등록 전이라 지워도 소용없고, 곧 등록되면 다음 메시지에서 다시 판단된다).
-   후보마다 `RemoveRunner`를 호출하고 unit을 **Draining**으로 둔다. 성공하면 runner 프로세스가 스스로 종료해 `die`가 오고 평소 정리 경로(6번)를 탄다. **컨테이너를 직접 rm하지 않는다.** 실패(job 진행 중을 뜻하는 4xx, `JobStillRunningError` 포함)는 "busy였다"로 보고 Running으로 되돌리고 건너뛴다.
+   후보마다 `RemoveRunner`를 호출하고 unit을 **Draining**으로 둔다. 성공하면 runner 프로세스가 스스로 종료해 `die`가 오고 평소 정리 경로(5번)를 탄다. **컨테이너를 직접 rm하지 않는다.** 실패(job 진행 중을 뜻하는 4xx, `JobStillRunningError` 포함)는 "busy였다"로 보고 Running으로 되돌리고 건너뛴다.
    busy 추적(`JobStarted`의 RunnerName)은 후보를 줄이는 최적화일 뿐이다. job 배정 뒤 `JobStarted` 도착까지 구간이 있으므로 정확성은 `RemoveRunner`의 거절이 보장한다. Draining unit은 tick의 "Running 미등록 → 정리" 판정(§8.3)에서 제외한다.
 4. **JIT config 전달** (확정, 유일한 방식): `create` → `cp` → `start` 3단계. attach 의미론에 의존하지 않는다. (`docker run -i`는 ssh 세션 종료 시 SIGHUP이 `--sig-proxy`로 컨테이너에 전달되어 결정적이지 않으므로 쓰지 않는다.)
    ```
@@ -297,8 +301,7 @@ machines:
    **요구사항**: 값이 argv, 컨테이너 env(`docker inspect`의 Config.Env·Args), 원격 디스크 어디에도 남지 않으며 컨테이너 안에 `.jitconfig` 파일이 남지 않는다. 프로세스 env(`/proc/<pid>/environ`)는 ARC와 동일하게 허용한다.
    커스텀 이미지도 위 래퍼가 동작해야 한다(bash + `/home/runner/run.sh`, sidecar면 `[ -S ]`를 지원하는 sh, §9.1).
    runner 기동 타임아웃 2분(코드 상수): (sidecar면 slice·볼륨·sidecar 생성 포함) `create`→`cp`→`start`가 2분 안에 끝나 runner 컨테이너가 `running`에 들어가지 못하면 unit 전체 rm 후 재배치. GitHub 등록 대기는 별도로 §8.3의 grace 5분을 따른다.
-5. `DeleteMessage`로 ack.
-6. `die` 이벤트 → §8.3 정리 순서대로 unit 정리(GitHub 등록 확인·제거 → 컨테이너 → 볼륨 → slice), 캐시 갱신, `minRunners` 미달분만 보충. **신규 unit 생성은 새 통계(`TotalAssignedJobs`)가 담긴 메시지에서만** 한다(3번). 이유: job 완료 직후 `die`가 먼저 오고 통계는 다음 메시지에서 줄어들므로, 캐시된 assigned 값으로 `die` 시점에 재생성하면 유휴 runner가 생긴다. pending job도 다음 메시지의 3번에서 처리된다.
+5. `die` 이벤트 → §8.3 정리 순서대로 unit 정리(GitHub 등록 확인·제거 → 컨테이너 → 볼륨 → slice), 캐시 갱신, `minRunners` 미달분만 보충. busy였던 unit이고 완료 표시가 없으면 runner 이름을 `pendingCompletion`에 넣는다(3번). **신규 unit 생성은 3번의 desired 계산에서만** 일어난다. `die` 시점에 생성하지 않는 것은 특례가 아니라 3번 식의 귀결이다: job 완료 직후 `die`가 먼저 오고 통계는 다음 메시지에서 줄어들지만, `assigned − |pendingCompletion|`이 이미 완료분을 뺀 값이라 캐시된 통계로 계산해도 유휴 runner가 생기지 않는다. pending job도 다음 메시지의 3번에서 처리된다.
 
 ### 7.3 종료 (SIGINT/SIGTERM)
 - 세션 종료, SSH 연결 정리. **실행 중 컨테이너는 kill하지 않는다**(ephemeral이므로 job 종료 후 자연 소멸, 재시작 시 입양).
@@ -349,6 +352,7 @@ unit id를 알 수 없는 고아 등록(GenerateJIT 직후·컨테이너 create 
 | grace | 5분 | 위 표의 등록 대기 |
 | 상태 대조 tick | 30s | `GetRunnerByName` 대조, grace·기동 타임아웃 판정 주기 |
 | GitHub 큐 대기 | 24h | pending job이 큐에서 기다리는 상한(§7.2-3) |
+| 완료 보정 만료 | 5분 | `pendingCompletion` 항목 유지 상한(§7.2-3). tick에서 판정 |
 | SSH 접속 타임아웃 | 10s | 접속·재접속 시도 1회당(§7.1-8, §10.1) |
 | runner 기동 타임아웃 | 2분 | create→cp→start 완료까지(§7.2-4) |
 

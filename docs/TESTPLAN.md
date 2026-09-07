@@ -33,9 +33,10 @@
 - (controller/core) `msgDesired` → desired 계산 → spread → `startUnit`(create→cp→start) → `Starting`, `SetMaxRunners` 반영 (§7.2-1·3·4).
 - (controller/core) tick의 등록 대조: Starting 승격·grace 초과 Dying, Running 미등록 즉시 Dying (§8.3).
 - (controller/core) 정리 순서: GetRunner → RemoveRunner → 컨테이너 → sidecar → 볼륨 → slice, 각 단계 멱등 (§8.3).
-- (controller/core) die 후 신규 생성 없음(minRunners 보충만), Creating 중 die, startUnit 실패 역순 정리 (§7.2-6).
+- (controller/core) die 후 신규 생성 없음(minRunners 보충만), Creating 중 die, startUnit 실패 역순 정리 (§7.2-5).
 - (controller/ext) R24의 도달/미도달 분기 (시작 시 1회).
 - (controller/ext) 축소: `msgDesired`에서만, `RemoveRunner` 거절 시 Running 복귀, Draining 중 die → Dying, Draining은 tick 대조 제외 (§7.2-3).
+- (controller/ext) `pendingCompletion` 보정: busy unit die → 캐시 값 `msgDesired`에서 생성 없음, `JobCompleted`가 die보다 먼저·나중 어느 쪽이든 항목이 남지 않음, 같은 메시지의 `JobCompleted`+`JobAvailable`(값 동일)에서 생성됨, 세션 재시작·재동기화·5분 만료로 비워짐 (§7.2-3).
 - (controller/ext) `msgResynced` → `plan.Reconcile` 결과 적용: 입양(Starting 진입), RemoveUnit, RemoveOrphan (§8.3, DESIGN §5 경계).
 - (controller/ext) 재동기화 후 known unit의 `Parts`가 스냅샷과 일치하고 `State`·`Busy`는 보존된다: 캐시에 있던 부품이 스냅샷에 없으면 지워지고, 스냅샷에만 있으면 채워진다 (DESIGN §6 `msgResynced`).
 - (controller/ext) Dying unit의 slot 점유 유지와 tick 재시도, unhealthy 머신의 Dying 보류, `msgHealth`에 따른 capacity 재계산 (§8.3).

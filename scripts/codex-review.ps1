@@ -54,5 +54,50 @@ $args += "`"$instruction`""
 
 Write-Host "codex-review: phase=$Phase packages=$Packages base=$Base model=$Model effort=$Effort"
 Set-Location $repo
-& node @args
+# The companion prints the rendered result only after `codex app-server` exits. When the review used
+# tools, codex leaves `codex-code-mode-host` / `node_repl` grandchildren holding the app-server pipes,
+# so the app-server never exits and the companion waits forever (its own teardown only fires on an
+# explicit close). Run node detached, watch its stderr for the companion's completion line, and if it
+# is still alive after a grace period, kill the descendants below node (deepest first). The app-server's
+# exit then unblocks the companion, which flushes the result and exits by itself.
+$stdoutPath = Join-Path $outDir "companion.stdout.txt"
+$stderrPath = Join-Path $outDir "companion.stderr.txt"
+Remove-Item $stdoutPath, $stderrPath -ErrorAction SilentlyContinue
+$proc = Start-Process -FilePath "node" -ArgumentList $args -WorkingDirectory $repo -NoNewWindow -PassThru `
+    -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+
+$completionMarker = "Turn completion inferred"
+$graceAfterDone = 30      # seconds to let the companion exit on its own after the marker
+$hardLimit = 45 * 60      # seconds for the whole review
+$doneAt = $null
+$started = Get-Date
+$killedTree = $false
+
+function Get-DescendantPids([int] $parentPid) {
+    $out = @()
+    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $parentPid" -ErrorAction SilentlyContinue
+    foreach ($c in $children) { $out += Get-DescendantPids ([int]$c.ProcessId); $out += [int]$c.ProcessId }
+    return $out
+}
+
+while (-not $proc.HasExited) {
+    Start-Sleep -Seconds 2
+    $now = Get-Date
+    if ($null -eq $doneAt -and (Test-Path $stderrPath)) {
+        if ((Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue) -match [regex]::Escape($completionMarker)) { $doneAt = $now }
+    }
+    $overGrace = ($null -ne $doneAt) -and (($now - $doneAt).TotalSeconds -ge $graceAfterDone)
+    $overLimit = ($now - $started).TotalSeconds -ge $hardLimit
+    if (($overGrace -or $overLimit) -and -not $killedTree) {
+        $killedTree = $true
+        $desc = Get-DescendantPids $proc.Id   # deepest first
+        Write-Host "codex-review: companion did not exit ($(if ($overLimit) { 'hard limit' } else { 'after completion' })); terminating $($desc.Count) descendant process(es)"
+        foreach ($d in $desc) { Stop-Process -Id $d -Force -ErrorAction SilentlyContinue }
+        $proc.WaitForExit(30000) | Out-Null
+        if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue; $proc.WaitForExit() }
+    }
+}
+if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Raw -Encoding utf8 | Write-Output }
+if (Test-Path $stderrPath) { Get-Content $stderrPath -Raw -Encoding utf8 | Write-Output }
+exit $proc.ExitCode
 exit $LASTEXITCODE

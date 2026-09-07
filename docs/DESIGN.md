@@ -54,6 +54,7 @@ type Unit struct {
     Foreign    bool            // 라벨의 scale set이 YAML에 없음 → 머신 slot 1개로 계산 [§8.3]
     RunnerName string          // <scaleSet>-<machine>-<unit>. GetRunnerByName 키 [§4.3]
     Busy       bool            // JobStarted 수신. 축소 후보 제외용 최적화일 뿐 정확성 근거가 아님 [§7.2-3]
+    Completed  bool            // JobCompleted 수신(die 보다 먼저 온 경우). die 시 pendingCompletion 에 넣지 않는다 [§7.2-3]
     Parts      Parts           // 존재하는 부품 집합
 }
 
@@ -312,8 +313,16 @@ type Client interface {
     // 라이브러리의 newRequestResponseError 가 응답 본문의 AgentNotFoundException 을 이 sentinel 로 감싼다
     // 축소(§7.2-3)에서는 거절을 busy 로 해석한다: IsBusy(err) 참조
     RemoveRunner(ctx, runnerID int64) error
-    // *scaleset.MessageSessionClient 반환. GetMessage/DeleteMessage/AcquireJobs/Session 을 갖춰 listener.Client 를 만족한다
-    NewSession(ctx, scaleSetID int, owner string) (listener.Client, error)
+    // *scaleset.MessageSessionClient 반환. GetMessage/DeleteMessage/AcquireJobs/Session 을 갖춰 listener.Client 를 만족하고,
+    // Close 로 세션을 지운다. listener.Client 에는 Close 가 없고 Listener.Run 도 세션을 닫지 않으므로(v0.4.0 listener.go)
+    // Controller 가 세션을 보유하고 ctx 취소 시 Close 를 호출한다(SPEC §7.3). listener 재시작 시에도 이전 세션을 먼저 닫는다
+    NewSession(ctx, scaleSetID int, owner string) (Session, error)
+}
+
+// Session 은 listener 가 요구하는 메시지 클라이언트에 세션 정리를 더한 것이다.
+type Session interface {
+    listener.Client
+    Close(ctx context.Context) error
 }
 
 // IsBusy: RemoveRunner 오류가 "job 진행 중"을 뜻하면 true.
@@ -334,12 +343,15 @@ scale set마다 `listener.Listener` 하나를 `Run(ctx, scaler)`로 띄운다. `
 func (s *scaleSetScaler) HandleDesiredRunnerCount(ctx, count int) (int, error)
     // count = TotalAssignedJobs. Controller 루프에 msgDesired 를 보내고 결과(실제 running 목표)를 기다린다.
 func (s *scaleSetScaler) HandleJobStarted(ctx, *scaleset.JobStarted) error   // RunnerName 으로 unit 을 찾아 msgJobStarted → Busy=true [§7.2-3]
-func (s *scaleSetScaler) HandleJobCompleted(ctx, *scaleset.JobCompleted) error // 로그만 (ephemeral 이라 die 가 뒤따른다)
+func (s *scaleSetScaler) HandleJobCompleted(ctx, *scaleset.JobCompleted) error // RunnerName(비면 RunnerID)으로 unit 을 찾아 msgJobCompleted → 살아 있으면 Completed=true, 이미 die 했으면 pendingCompletion 에서 제거 [§7.2-3]
 ```
 
 확인된 listener 동작(v0.4.0 소스 기준):
 - `JobAvailableMessages`를 **전부** `AcquireJobs`한다. [§7.2-2]
 - 초기 세션의 `Statistics.TotalAssignedJobs`와 이후 **매 메시지**의 `TotalAssignedJobs`를 `HandleDesiredRunnerCount`에 넘긴다. 반환값은 메트릭 기록에만 쓴다.
+- **빈 폴링**(long-poll 만료, `msg == nil`)에도 직전 메시지의 `Statistics`를 캐시해 **같은** `TotalAssignedJobs`로 `HandleDesiredRunnerCount`를 부른다(`listener/listener.go` 189~190행). 콜백 인자만으로는 새 통계와 캐시를 구분할 수 없으므로 Controller는 §7.2-3의 `pendingCompletion` 보정으로 완료분을 뺀다.
+- 한 메시지 안의 호출 순서는 `DeleteMessage` → `AcquireJobs` → `HandleJobStarted`(각) → `HandleJobCompleted`(각) → `HandleDesiredRunnerCount`로 고정이다(`listener/listener.go` 207~237행). 완료를 반영한 통계와 그 `JobCompleted`는 같은 묶음에서 `JobCompleted`가 먼저 처리되므로, desired 계산 시점에 `pendingCompletion`은 이미 갱신돼 있다.
+- Controller는 scale set별 `pendingCompletion`(runner 이름 → 등록 시각)과 unit별 `Completed`를 보유한다. 갱신 지점: `msgJobCompleted`(unit이 살아 있으면 `Completed=true`, 이미 die 했으면 집합에서 제거), busy unit의 `die`(`Completed`면 넣지 않고, 아니면 집합에 추가), 세션 재시작(전부 비움), `msgResynced`(그 머신 소속 unit의 항목만 비움), `msgTick`(5분 만료 항목 제거, §8.3 상수 표). 이름 키라 중복 콜백에 멱등이다.
 - `SetMaxRunners(n)`은 atomic 저장이며 다음 `GetMessage`의 `maxCapacity`에 반영된다. [§7.2-1]
 - `listener.Config.Validate`는 `0 ≤ MaxRunners ≤ MaxInt32`를 요구한다. **MaxRunners 0이 허용**되므로 capacity 0인 scale set도 listener를 정상 시작하고, 운영 중 `SetMaxRunners(0)`도 허용된다. 중지·재시작 로직은 필요 없다.
 - 초기 세션의 `Statistics`가 nil이면 `Run`이 오류를 반환한다. Controller는 listener 오류를 로그 후 백오프(§7 백오프와 동일 수열)로 재시작한다.
@@ -401,6 +413,7 @@ type (
     msgTick         struct{}                                   // 30s 코드 상수 [§8.3 상수 표]
     msgUnitStarted  struct{ Unit UnitID; Err error }           // 비동기 create→cp→start 완료
     msgJobStarted   struct{ ScaleSet, RunnerName string }      // listener HandleJobStarted → Busy=true
+    msgJobCompleted struct{ ScaleSet, RunnerName string; RunnerID int64 } // listener HandleJobCompleted → Completed / pendingCompletion 갱신 [§7.2-3]
     msgDrainResult  struct{ Unit UnitID; Busy bool; Err error } // 비동기 RemoveRunner(축소) 결과
     msgCleanupDone  struct{ Unit UnitID; Err error }           // 비동기 cleanupUnit 결과
 )
@@ -410,14 +423,15 @@ type (
 
 | 메시지 | 동작 |
 |---|---|
-| `msgDesired` | capacity 재계산 → 바뀌면 `SetMaxRunners`. `desired = Desired(capacity, minRunners, Assigned)`. `create = desired − running > 0`이면 **신규 unit 생성은 여기서만**: spread(occupied 기준)로 머신 선택 → `Creating` 등록 → goroutine `startUnit`. `remove = running − desired > 0`이면 **축소도 여기서만**: `plan.ScaleDown`으로 후보 선정 → `Draining` → goroutine으로 `RemoveRunner`(결과는 `msgDrainResult`). Reply에 running 목표를 보낸다. [§7.2-3] |
+| `msgDesired` | capacity 재계산 → 바뀌면 `SetMaxRunners`. `desired = Desired(capacity, minRunners, max(0, Assigned − len(pendingCompletion)))`(§7.2-3). `create = desired − running > 0`이면 **신규 unit 생성은 여기서만**: spread(occupied 기준)로 머신 선택 → `Creating` 등록 → goroutine `startUnit`. `remove = running − desired > 0`이면 **축소도 여기서만**: `plan.ScaleDown`으로 후보 선정 → `Draining` → goroutine으로 `RemoveRunner`(결과는 `msgDrainResult`). Reply에 running 목표를 보낸다. [§7.2-3] |
 | `msgDrainResult` | 성공: `Draining` 유지, `die`를 기다린다. `Busy`(IsBusy) 또는 기타 오류: `Running`으로 복귀(오류는 로그). unit이 이미 `Dying`이면 무시. [§7.2-3] |
 | `msgJobStarted` | RunnerName으로 unit을 찾아 `Busy=true`. 못 찾으면 로그만. |
-| `msgEvent` (`die`, role=runner) | unit(Creating/Starting/Running/Draining 모두)을 `Dying`으로 → goroutine `cleanupUnit`. 그 뒤 `minRunners` 미달분만 보충하고 **assigned 기반 신규 생성은 하지 않는다**. [§7.2-6] |
+| `msgJobCompleted` | RunnerName(비면 RunnerID)으로 unit을 찾는다. 살아 있으면 `Completed=true`. 없거나 이미 `Dying`/제거됐으면 그 scale set의 `pendingCompletion`에서 이름을 뺀다(없으면 무시). [§7.2-3] |
+| `msgEvent` (`die`, role=runner) | unit(Creating/Starting/Running/Draining 모두)을 `Dying`으로 → goroutine `cleanupUnit`. `Busy && !Completed`면 RunnerName을 `pendingCompletion`에 넣는다(등록 시각 기록). 그 뒤 `minRunners` 미달분만 보충하고 **assigned 기반 신규 생성은 하지 않는다**(§7.2-3 식의 귀결). [§7.2-3, §7.2-5] |
 | `msgEvent` (`die`, role=sidecar) | runner가 살아 있으면 로그만(runner die 시 함께 정리). |
 | `msgHealth` | 머신 health 갱신 → capacity 재계산 → `SetMaxRunners`. unhealthy 머신의 Dying unit은 정리를 보류한다. |
-| `msgResynced` | **부품은 스냅샷이 권위다.** `plan.Reconcile` 실행 **전에** 이 머신 소속 known unit의 `Parts`를 `Obs`가 보여준 부품 집합으로 덮어쓴다(정리 실패나 외부 rm으로 캐시가 어긋나면 §8.3의 slot 점유 계산이 틀어진다). `State`는 유지한다 — 상태 판정에는 GitHub 등록 대조가 필요해 `Reconcile`이 판정하지 않는다(§5 책임 경계). `Busy`도 유지한다 — 출처가 머신 이벤트가 아니라 메시지 세션(`msgJobStarted`)이라 SSH 단절로 낡지 않고, 되채우는 경로가 없어 리셋하면 남은 생애 동안 `false`로 고정된다. 그 다음 `Reconcile` 결과의 Adopt/RemoveUnit/RemoveOrphan을 적용한다(보류된 Dying 포함). 부품 집합만 판정하고 GitHub은 조회하지 않는다. 머신 healthy 복귀. |
-| `msgTick` | **GitHub 등록 대조의 유일한 구현 주체.** Starting/Running unit마다 `GetRunner`로 대조(**Draining 제외**): Starting은 등록되면 `Running`, grace 초과면 `Dying`; Running은 미등록이면 `Dying`. `Creating`의 기동 타임아웃 판정. healthy 머신의 `Dying` unit 중 정리가 진행 중이 아닌 것은 `cleanupUnit` 재시도. [§8.3] |
+| `msgResynced` | **부품은 스냅샷이 권위다.** `plan.Reconcile` 실행 **전에** 이 머신 소속 known unit의 `Parts`를 `Obs`가 보여준 부품 집합으로 덮어쓴다(정리 실패나 외부 rm으로 캐시가 어긋나면 §8.3의 slot 점유 계산이 틀어진다). `State`는 유지한다 — 상태 판정에는 GitHub 등록 대조가 필요해 `Reconcile`이 판정하지 않는다(§5 책임 경계). `Busy`도 유지한다 — 출처가 머신 이벤트가 아니라 메시지 세션(`msgJobStarted`)이라 SSH 단절로 낡지 않고, 되채우는 경로가 없어 리셋하면 남은 생애 동안 `false`로 고정된다. 그 다음 `Reconcile` 결과의 Adopt/RemoveUnit/RemoveOrphan을 적용한다(보류된 Dying 포함). 부품 집합만 판정하고 GitHub은 조회하지 않는다. 이 머신 소속 unit의 `pendingCompletion` 항목을 비운다(§7.2-3 안전장치). 머신 healthy 복귀. |
+| `msgTick` | **GitHub 등록 대조의 유일한 구현 주체.** Starting/Running unit마다 `GetRunner`로 대조(**Draining 제외**): Starting은 등록되면 `Running`, grace 초과면 `Dying`; Running은 미등록이면 `Dying`. `Creating`의 기동 타임아웃 판정. healthy 머신의 `Dying` unit 중 정리가 진행 중이 아닌 것은 `cleanupUnit` 재시도. `pendingCompletion`에서 5분 지난 항목 제거(§7.2-3 안전장치, §8.3 상수 표). [§8.3] |
 | `msgUnitStarted` | 성공: `Creating → Starting`. 실패: `Dying`으로 두고 `cleanupUnit`(역순 정리, RemoveRunner 포함). 다음 `msgDesired`에서 재배치. unit이 이미 `Dying`이면 무시. |
 | `msgCleanupDone` | 성공: `Removed`(상태에서 삭제, slot 해제). 실패: `Dying` 유지, 다음 tick에서 재시도. |
 
