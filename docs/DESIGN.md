@@ -115,7 +115,7 @@ type ScaleSet struct {
 
 집계 정의 [§7.2-3, §8.3]:
 - `running(scaleSet)` = Creating + Starting + Running + Draining (desired 계산용)
-- `occupied(machine)` = running + Dying(부품 잔존) + Foreign unit (spread·여유 슬롯 계산용)
+- `occupied(machine)` = running + Dying(부품 잔존) + Foreign unit (spread의 사용률·여유 슬롯 계산용. §8.2)
 
 **정리 순서** (Dying, 기동 타임아웃, 재시작 후 exited 발견, startUnit 실패 역순 정리 모두 동일): [§8.3]
 ```
@@ -338,7 +338,7 @@ func PhysicalMax(machine, unit resource.Budget) int                             
 func EffectiveMax(physical int, maxRunners *int) int                                  // [§8.1, R22]
 func Capacity(ss domain.ScaleSet, machines []domain.Machine) int                      // Healthy 만 합산, ss.MaxRunners 로 cap [§8.1, R23]
 func Desired(capacity, minRunners, assigned int) int                                  // min(cap, max(min, assigned)) [§7.2-3]
-func Spread(machines []domain.Machine, occupied map[string]int, now time.Time) (string, bool) // 사용률 최저 → 여유 슬롯 → LastPlacedAt → 순서 [§8.2]
+func Spread(machines []domain.Machine, occupied map[string]int, now time.Time) (string, bool) // occupied/effectiveMax 최저 → 여유 슬롯 → LastPlacedAt → 순서 [§8.2]
 func ScaleDown(units []domain.Unit, remove int) []domain.UnitID                       // Running && !Busy, CreatedAt 오래된 순, remove 개 [§7.2-3]
 func Reconcile(obs Observed, known map[domain.UnitID]domain.Unit, now time.Time, cfg ReconcileConfig) []Action  // [§8.3]
 
@@ -358,7 +358,9 @@ type Action struct {
 
 **책임 경계 (tick vs Reconcile)**: GitHub 등록 대조는 `msgTick`에서만 한다. `Reconcile`은 재동기화 시점의 **부품 집합만** 판정한다. 그래서 `Observed`에 등록 여부가 없고, SPEC §8.3의 "runner 살아 있는데 등록 없음" 행은 `Reconcile`이 아니라 Controller의 tick 처리가 구현 주체다. 입양된 살아 있는 unit은 등록 여부를 보지 않고 `Starting`으로 들어가며(CreatedAt = 컨테이너 생성 시각), 다음 tick이 `GetRunner`로 `Running` 승격 또는 grace 초과 `Dying`을 판정한다(§3.2). `runtime.Container`를 입력으로 받기 위해 `plan → runtime`의 타입 의존이 생기지만 `runtime`의 I/O 함수는 호출하지 않는다.
 
-`occupied` 계산에서 `Foreign` unit은 머신 slot 1개, `Dying` unit은 부품이 남아 있는 동안 slot 1개로 센다. [§8.3]
+입양 시 `Unit.Machine`은 도달한 머신(`Observed.Machine`)이지만 `RunnerName`은 라벨의 `gh-ars.scaleSet`/`gh-ars.machine`으로 만든다. 등록은 생성 당시 이름으로 되어 있어 그 이름이라야 tick의 `GetRunner` 대조와 정리 시 `RemoveRunner`가 맞는다(§4.3, §8.3). `known`에 있고 `Creating`인 unit은 판정에서 제외한다(§8.3 Creating 예외).
+
+`occupied` 계산에서 `Foreign` unit은 머신 slot 1개, `Dying` unit은 부품이 남아 있는 동안 slot 1개로 센다. [§8.3] `Spread`는 여유 슬롯과 사용률을 모두 이 `occupied`로 계산한다(§8.2). scale set 단위 `running` 집계는 `Desired` 쪽 입력이고 배치에는 쓰지 않는다.
 
 GitHub 등록 제거는 별도 Action이 아니라 **`RemoveUnit` 실행의 첫 단계**(§3.2 정리 순서)다. SPEC §8.3 표의 각 행이 테스트 케이스 하나이며, 등록 관련 두 행(등록 없음, 정리 시 등록 처리)은 `controller` 테스트에 속한다(TESTPLAN §1 태그 참조).
 
@@ -397,7 +399,7 @@ type (
 | `msgEvent` (`die`, role=runner) | unit(Creating/Starting/Running/Draining 모두)을 `Dying`으로 → goroutine `cleanupUnit`. 그 뒤 `minRunners` 미달분만 보충하고 **assigned 기반 신규 생성은 하지 않는다**. [§7.2-6] |
 | `msgEvent` (`die`, role=sidecar) | runner가 살아 있으면 로그만(runner die 시 함께 정리). |
 | `msgHealth` | 머신 health 갱신 → capacity 재계산 → `SetMaxRunners`. unhealthy 머신의 Dying unit은 정리를 보류한다. |
-| `msgResynced` | `plan.Reconcile` 실행 → Adopt/RemoveUnit/RemoveOrphan 적용(보류된 Dying 포함). 부품 집합만 판정하고 GitHub은 조회하지 않는다. 머신 healthy 복귀. |
+| `msgResynced` | **부품은 스냅샷이 권위다.** `plan.Reconcile` 실행 **전에** 이 머신 소속 known unit의 `Parts`를 `Obs`가 보여준 부품 집합으로 덮어쓴다(정리 실패나 외부 rm으로 캐시가 어긋나면 §8.3의 slot 점유 계산이 틀어진다). `State`는 유지한다 — 상태 판정에는 GitHub 등록 대조가 필요해 `Reconcile`이 판정하지 않는다(§5 책임 경계). `Busy`도 유지한다 — 출처가 머신 이벤트가 아니라 메시지 세션(`msgJobStarted`)이라 SSH 단절로 낡지 않고, 되채우는 경로가 없어 리셋하면 남은 생애 동안 `false`로 고정된다. 그 다음 `Reconcile` 결과의 Adopt/RemoveUnit/RemoveOrphan을 적용한다(보류된 Dying 포함). 부품 집합만 판정하고 GitHub은 조회하지 않는다. 머신 healthy 복귀. |
 | `msgTick` | **GitHub 등록 대조의 유일한 구현 주체.** Starting/Running unit마다 `GetRunner`로 대조(**Draining 제외**): Starting은 등록되면 `Running`, grace 초과면 `Dying`; Running은 미등록이면 `Dying`. `Creating`의 기동 타임아웃 판정. healthy 머신의 `Dying` unit 중 정리가 진행 중이 아닌 것은 `cleanupUnit` 재시도. [§8.3] |
 | `msgUnitStarted` | 성공: `Creating → Starting`. 실패: `Dying`으로 두고 `cleanupUnit`(역순 정리, RemoveRunner 포함). 다음 `msgDesired`에서 재배치. unit이 이미 `Dying`이면 무시. |
 | `msgCleanupDone` | 성공: `Removed`(상태에서 삭제, slot 해제). 실패: `Dying` 유지, 다음 tick에서 재시도. |

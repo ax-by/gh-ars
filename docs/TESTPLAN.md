@@ -37,6 +37,7 @@
 - (controller/ext) R24의 도달/미도달 분기 (시작 시 1회).
 - (controller/ext) 축소: `msgDesired`에서만, `RemoveRunner` 거절 시 Running 복귀, Draining 중 die → Dying, Draining은 tick 대조 제외 (§7.2-3).
 - (controller/ext) `msgResynced` → `plan.Reconcile` 결과 적용: 입양(Starting 진입), RemoveUnit, RemoveOrphan (§8.3, DESIGN §5 경계).
+- (controller/ext) 재동기화 후 known unit의 `Parts`가 스냅샷과 일치하고 `State`·`Busy`는 보존된다: 캐시에 있던 부품이 스냅샷에 없으면 지워지고, 스냅샷에만 있으면 채워진다 (DESIGN §6 `msgResynced`).
 - (controller/ext) Dying unit의 slot 점유 유지와 tick 재시도, unhealthy 머신의 Dying 보류, `msgHealth`에 따른 capacity 재계산 (§8.3).
 
 ## 2. 수동 E2E 체크리스트 (실제 GitHub **repo scope**, 결과는 로그 + `docker ps` + GitHub runner 목록 스크린샷으로 기록)

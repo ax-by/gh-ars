@@ -317,7 +317,8 @@ capacity가 `X-ScaleSetMaxCapacity`로 보고된다. 적용 방식: none은 컨�
 
 ### 8.2 spread
 - 후보: healthy이고 여유 슬롯 > 0인 머신.
-- 기준: `running / effectiveMax` **사용률 최저**. (여유 슬롯 절대값 기준이면 큰 머신만 계속 뽑혀 작은 머신이 놀고 큰 머신이 과열된다.)
+- 기준: `occupied / effectiveMax` **사용률 최저**. (여유 슬롯 절대값 기준이면 큰 머신만 계속 뽑혀 작은 머신이 놀고 큰 머신이 과열된다.)
+- `occupied(machine)` = running + Dying(부품 잔존) + Foreign unit. 여유 슬롯(`effectiveMax − occupied`)과 사용률 모두 같은 값을 쓴다. 정리에 실패해 리소스가 실제로 잡혀 있는 머신이 사용률 0으로 보여 과다 배치되지 않게 하기 위함이다(§8.3의 slot 점유 규칙과 같은 이유). `running`(§7.2-3)은 scale set 단위 desired 계산용이고, 머신 단위 배치에는 쓰지 않는다.
 - tie-break: ① 여유 슬롯 절대값 큰 쪽 → ② 마지막 배치 시각 오래된 쪽(round-robin 효과) → ③ YAML 순서(결정적).
 - warm runner(minRunners)도 같은 규칙.
 
@@ -327,13 +328,15 @@ capacity가 `X-ScaleSetMaxCapacity`로 보고된다. 적용 방식: none은 컨�
 | 상황 | 조치 |
 |---|---|
 | runner 컨테이너 살아 있고 라벨의 scale set이 YAML에 없음 | 입양. 예산을 알 수 없으므로 **그 머신의 slot 1개로 센다.** 종료까지 관리하고 새로 띄우지 않음 |
-| runner 컨테이너 살아 있고 라벨의 machine 이름이 YAML과 다름 | 입양. 소속은 SSH로 도달한 현재 머신(또는 local) |
+| runner 컨테이너 살아 있고 라벨의 machine 이름이 YAML과 다름 | 입양. 소속(배치·slot 계산)은 SSH로 도달한 현재 머신(또는 local). 단 GitHub 등록 이름은 등록 당시 이름이어야 `GetRunnerByName` 대조가 되므로 라벨의 `gh-ars.scaleSet`/`gh-ars.machine`으로 만든다(§4.3) |
 | runner 컨테이너 살아 있고 sidecar/볼륨/slice 일부 없음 | kill하지 않음. `die` 시 나머지 정리 |
 | runner 컨테이너 살아 있는데 GitHub에 등록이 없음 (`GetRunnerByName(<scaleSet>-<machine>-<unit>)` 단건 조회, tick 30s마다. **Starting과 Running에 적용, Draining은 제외**) | Starting: 생성 후 grace(5분) 이내면 대기(등록 전 정상 구간). 초과면 unit 정리. Running: grace 없이 즉시 unit 정리(job 종료 직후 등록이 먼저 사라지는 정상 구간이므로 `die`가 곧 뒤따른다). Draining: 축소로 등록을 지운 상태이므로 `die`를 기다린다 |
 | Dying unit의 정리 명령 실패 | `Dying` 유지. 머신이 healthy면 매 tick(30s)마다 재시도(별도 백오프 없음). 머신이 unhealthy면 healthy 복귀 후 전체 동기화에서 정리. **부품이 남아 있는 동안 머신 slot을 계속 점유한 것으로 센다**(리소스가 실제로 잡혀 있고, 정리 실패가 과다 배치로 번지지 않게) |
 | runner 컨테이너가 `exited` 상태로 남아 있음 | unit 정리 |
 | runner 컨테이너 없는 sidecar/볼륨/slice (머신 내부 고아) | 항상 rm |
 | unit 정리 시 GitHub 등록 처리 (Dying, 기동 타임아웃, 재시작 후 exited 발견 모두 포함) | 컨테이너 rm **전에** `GetRunnerByName`으로 등록을 확인하고, 있으면 `RemoveRunner` 후 rm. `GetRunnerByName`이 미존재(`nil, nil`)를 돌려주거나 `RemoveRunner`가 `RunnerNotFoundError`를 돌려주면(`errors.Is`) 성공으로 취급(ephemeral runner는 보통 스스로 해제 후 종료) |
+
+**Creating 예외**: gh-ars가 지금 만들고 있는 unit(`Creating`)의 부품은 위 표의 판정 대상이 아니다. `create`→`cp`→`start`(§7.2-4)가 진행 중인 동안에는 slice·볼륨·sidecar만 있거나 runner가 `created` 상태인 것이 정상이라, 이를 고아나 짝이 안 맞는 unit으로 보면 자기가 만들던 unit을 지운다. 이 구간의 실패·기동 타임아웃 2분·`die`는 §7.2-4가 책임진다.
 
 **unit 정리 순서**: `GetRunnerByName` → (있으면) `RemoveRunner` → runner 컨테이너 rm → sidecar rm → 볼륨 3개 rm → slice stop + revert.
 
