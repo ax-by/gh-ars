@@ -24,7 +24,7 @@
 | 4 | `executor/local` | §5 Executor, §10.2(local 사용자 권한) | §4.1 | TESTPLAN (executor/local) | 완료 2026-09-07 |
 | 5 | `runtime/docker` + `jittar` | §7.2-4 none 래퍼·tar, §9.1 볼륨·라벨, §4.2 라벨 | §4.2 | TESTPLAN (runtime/docker), (runtime/jittar). 실제 docker로 수동 확인 | 완료 2026-09-07 |
 | 6 | `github` | §7.1-5, §7.2-1·2·4, §8.3 등록 처리, §11, R7 | §4.4, §4.5 | TESTPLAN (github). 실제 repo에 ensure/JIT/GetRunner/RemoveRunner/delete 수동 확인 | 완료 2026-09-08 |
-| 7 | `controller` 최소(none, local, docker) + `cmd` — walking skeleton | §7 전체(none·local 범위), §8.3 정리 순서, §11 | §6, §9, §4.5 | TESTPLAN (controller/core). E2E-lite: 실제 repo에서 job 1개 완주(사람 실행) | 미착수 |
+| 7 | `controller` 최소(none, local, docker) + `cmd` — walking skeleton | §7 전체(none·local 범위), §8.3 정리 순서, §11 | §6, §9, §4.5 | TESTPLAN (controller/core). E2E-lite: 실제 repo에서 job 1개 완주(사람 실행) | 완료 2026-09-08 |
 | 8 | `executor/ssh` | §10.1, R20 | §4.1 | TESTPLAN (executor/ssh) | 미착수 |
 | 9 | `runtime/podman` | §9.2 podman info 형식, §10.2 규칙 3 경로 | §4.2 | TESTPLAN (runtime/podman). Phase 0-3 결과 필요 | 미착수 |
 | 10 | `machine` 에이전트 | §7.1-3·4·7·8, §10.2, R16, R21, R22 | §7, §3.3 | TESTPLAN (machine) | 미착수 |
@@ -83,6 +83,23 @@ podman rm -f t4
 ```
 결과: 통과 (2026-09-06, WSL2 Ubuntu, podman 5.7.0). `cat /tmp/f` 결과 `x`, 기대값과 일치.
 
+## Phase 7 E2E-lite 체크리스트 (사람 실행, local docker 머신 1대, none 모드)
+
+Phase 7 코드 범위: local executor + docker + none 모드. SSH 머신·podman 머신·sidecar scale set 은 시작 시 "아직 지원하지 않는 구성" 오류로 거부한다(Phase 8·9·12). 시작 시 preflight 에 실패한 머신은 healthy 로 복귀해도 예산이 0 이라 배치되지 않는다(재접속 후 preflight 는 Phase 10). 축소(Draining)는 로그만 남긴다(Phase 11).
+
+전제: Linux 머신(WSL2 가능), rootful 또는 docker 그룹 사용자, repo scope PAT(`repo`), 워크플로 하나(`runs-on: <scaleSet 이름>`).
+
+| 단계 | 실행 명령 | 기대 로그 (`--log-format text`) | 확인 명령 | 결과 |
+|---|---|---|---|---|
+| 1 시작 | `export GITHUB_PAT=...; ./gh-ars run -c lite.yaml --log-format text` (lite.yaml: `github.url` repo, `scaleSets[0]`={name: lite, maxRunners: 2, resources: {cpu: 1, memory: 2Gi}}, `machines[0]`={name: local, scaleSet: lite} — host 없음) | `image pulled` → `machine ready … physicalMax=N effectiveMax=N` → `scale set found/created` → `controller running` → listener `Getting next message` | `docker ps -a --filter label=gh-ars.unit` 비어 있음, GitHub Settings → Actions → Runners 에 `lite` scale set 존재 | |
+| 2 job 수신 | 워크플로 push (`runs-on: lite`) | `desired … totalAssigned=1` → `unit creating unit=<ULID> machine=local runner=lite-local-<ULID>` → `unit started runnerID=…` | `docker ps` 에 `gh-ars-<ULID>-runner` running. `docker inspect gh-ars-<ULID>-runner --format '{{.Config.Env}} {{.Args}}'` 에 JIT 값 없음. `docker exec gh-ars-<ULID>-runner test ! -e /home/runner/.jitconfig && echo clean` → `clean` | |
+| 3 등록·실행 | (대기 ≤30s tick) | `runner registered` → (job 시작) `JobStarted` 수신 뒤 Busy(로그 없음) | GitHub Runners 목록에 `lite-local-<ULID>` online → busy | |
+| 4 완료·정리 | (job 완료) | `runner died … exitCode=0` → `runner registration absent` 또는 `runner registration removed` → `unit removed` | `docker ps -a --filter label=gh-ars.unit` 비어 있음. GitHub Runners 목록에 runner 없음. 이후 빈 폴링에서 `unit creating` 이 다시 나오지 않음(pendingCompletion 보정) | |
+| 5 종료 | Ctrl+C | `controller stopped`. 세션 삭제 오류 없음 | 재실행 시 `scale set found`(같은 id). 실행 중 job 이 있었다면 컨테이너가 살아 있고 재실행 로그에 `unit adopted` | |
+| 6 삭제 | `./gh-ars scaleset delete lite -c lite.yaml --log-format text` | `scale set deleted` | GitHub Runners 목록에 `lite` 없음. 재실행 시 `ErrScaleSetNotFound` 로그 | |
+
+결과는 아래 E2E 표의 `lite` 행에 기록한다.
+
 ## E2E 결과 (docs/TESTPLAN.md §2)
 
 | # | 시나리오 | 결과 | 일자 / 비고 |
@@ -99,5 +116,14 @@ podman rm -f t4
 
 구현 시 기본값으로 정하기로 한 항목(URL 판별 규칙, `${file:}` 공백 제거, 다이제스트 참조 허용, `RunnerSetting{Ephemeral, DisableUpdate}`, 세션 owner 문자열)은 코드 주석에 근거를 남긴다.
 
+- Phase 7 리뷰 doc-gap (사람이 DESIGN 반영 여부 결정). 코드는 아래대로 동작한다.
+  - DESIGN §2 의존 목록: `cmd → github`(DESIGN §9 의 `github.New`·`DeleteScaleSet` 호출에 필요), `controller → {config, resource, runtime(타입)}`, `machine → {domain, resource}` 가 목록에 없다.
+  - DESIGN §6 inbox 메시지 목록에 없는 메시지: `msgRegistration`(tick 의 `GetRunner` 를 goroutine 으로 빼고 결과를 받는다 — 루프 안에서 느린 GitHub 호출을 하지 않기 위해), `msgSessionStarted`(세션 재시작 시 `pendingCompletion` 비움). `msgDrainResult` 는 Phase 11.
+  - §8.3 "runner 살아 있는데 등록 없음 → 즉시 정리" 경로로 Dying 이 되는 busy·미완료 unit 도 `pendingCompletion` 에 넣는다(Dying 전이를 `markDying` 한 곳으로 모아 die 경로와 동일하게 보정). DESIGN §6 은 die 경로만 적고 있다.
+  - 이름이 빈 `JobCompleted` 가 runner id 를 알기 전(`msgUnitStarted`·입양 unit 의 tick 등록 확인 전)에 오면 `completedIDs` 에 보관했다가 id 를 알게 될 때 적용한다(만료 5분). DESIGN §4.5·§6 에 없는 보관 규칙.
+  - 머신 내부 고아 부품은 runner 이름 없는 Dying unit 으로 등록해 §8.3 정리 순서·tick 재시도·slot 점유를 그대로 탄다(GitHub 단계 생략). DESIGN §6 은 `RemoveOrphan` 을 개별 rm 으로만 적고 있다.
+  - 재동기화 스냅샷에 관측 시각을 실어, 그 뒤에 Starting 이 된 unit 은 Creating 예외로 판정에서 뺀다(DESIGN §5 `Observed` 에는 시각이 없다. `machine.Snapshot.At` → `msgResynced.At`).
+  - 정리 한 회차의 상한(2분, 기동 타임아웃과 같은 값)과 listener 백오프 리셋 조건(세션이 30s 이상 유지됐으면 리셋)은 SPEC 상수 표에 없다.
+  - die 가 `JobStarted` 보다 먼저 온 unit(이미 정리됨)의 늦은 `JobStarted` 는 DESIGN §6 대로 로그만 남긴다. 리뷰어 가설: 아주 짧은 job 에서 캐시 통계로 불필요한 1개가 뜰 수 있다(다음 통계에서 축소 대상, Phase 11).
 - R13 다이제스트 예외의 SPEC 명시 여부 (Phase 2 리뷰 doc-gap). 구현은 유효한 `@sha256:<64 hex>`/`@sha512:<128 hex>` 참조를 태그와 무관하게 허용한다(`internal/config/resolve.go` checkImage). SPEC R13에 한 줄 추가할지 사람이 결정.
 - ~~`scripts/codex-review.ps1`의 node 래퍼가 Codex 완료 후 종료하지 않는 문제~~ — 원인·수정 2026-09-07 (Phase 6). 리뷰가 도구를 쓰면 codex가 `codex-code-mode-host`·`node_repl` 손자를 남기고 이들이 app-server 파이프를 물어 companion의 `await exitPromise`가 풀리지 않았다. 래퍼가 stderr의 완료 줄을 감지하고 30초 뒤에도 살아 있으면 node 아래 후손을 종료한다(`.sh`도 1:1). 같은 원인으로 Codex 플러그인의 Stop 훅 리뷰도 고아 트리를 남길 수 있다(`/codex:setup`의 stop-time review gate 토글).

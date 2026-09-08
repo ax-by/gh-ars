@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	github.com/actions/scaleset v0.4.0
+	github.com/oklog/ulid/v2 v2.1.1
 	gopkg.in/yaml.v3 v3.0.1
 )
 

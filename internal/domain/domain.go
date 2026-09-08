@@ -88,6 +88,7 @@ type Unit struct {
 	Foreign    bool      // 라벨의 scale set 이 YAML 에 없음 → 머신 slot 1개로 계산 [§8.3]
 	RunnerName string    // <scaleSet>-<machine>-<unit>. GetRunnerByName 키 [§4.3]
 	Busy       bool      // JobStarted 수신. 축소 후보 제외용 최적화 [§7.2-3]
+	Completed  bool      // JobCompleted 수신(die 보다 먼저 온 경우). die 시 pendingCompletion 에 넣지 않는다 [§7.2-3]
 	Parts      Parts
 }
 
