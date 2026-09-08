@@ -114,8 +114,6 @@ Phase 7 코드 범위: local executor + docker + none 모드. SSH 머신·podman
 
 ## 남은 결정
 
-구현 시 기본값으로 정하기로 한 항목(URL 판별 규칙, `${file:}` 공백 제거, 다이제스트 참조 허용, `RunnerSetting{Ephemeral, DisableUpdate}`, 세션 owner 문자열)은 코드 주석에 근거를 남긴다.
+구현 시 기본값으로 정하기로 한 항목(URL 판별 규칙, `${file:}` 공백 제거, 다이제스트 참조 허용, `RunnerSetting{Ephemeral, DisableUpdate}`, 세션 owner 문자열)은 코드 주석에 근거를 남긴다. 완료한 결정은 이 목록에서 지운다(근거는 `docs/DECISIONS.md`).
 
-- ~~Phase 7 리뷰 doc-gap~~ — 2026-09-08 문서에 반영(SPEC R13·§7.2-3·§8.3, DESIGN §2·§4.5·§5·§6·§7, DECISIONS). 남은 것: 늦은 `JobStarted`(die가 먼저 온 unit)는 DESIGN §6 대로 로그만. 리뷰어 가설(아주 짧은 job에서 캐시 통계로 불필요한 1개)은 Phase 11 축소에서 회수되므로 그대로 둔다.
-- ~~R13 다이제스트 예외의 SPEC 명시 여부~~ — 2026-09-08 SPEC R13에 명시.
-- ~~`scripts/codex-review.ps1`의 node 래퍼가 Codex 완료 후 종료하지 않는 문제~~ — 원인·수정 2026-09-07 (Phase 6). 리뷰가 도구를 쓰면 codex가 `codex-code-mode-host`·`node_repl` 손자를 남기고 이들이 app-server 파이프를 물어 companion의 `await exitPromise`가 풀리지 않았다. 래퍼가 stderr의 완료 줄을 감지하고 30초 뒤에도 살아 있으면 node 아래 후손을 종료한다(`.sh`도 1:1). 같은 원인으로 Codex 플러그인의 Stop 훅 리뷰도 고아 트리를 남길 수 있다(`/codex:setup`의 stop-time review gate 토글).
+- 늦은 `JobStarted`(die가 먼저 와 이미 정리된 unit)는 DESIGN §6 대로 로그만 남긴다. Phase 7 리뷰어 가설: 아주 짧은 job에서 캐시 통계로 불필요한 unit 1개가 뜰 수 있다. Phase 11 축소에서 회수되는지 확인한 뒤 닫는다.
