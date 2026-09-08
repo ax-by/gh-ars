@@ -105,7 +105,7 @@ Phase 7 코드 범위: local executor + docker + none 모드. SSH 머신·podman
 | # | 시나리오 | 결과 | 일자 / 비고 |
 |---|---|---|---|
 | gh | Phase 6: 실제 repo에 ensure/JIT/GetRunner/RemoveRunner/session/delete. `$env:GH_ARS_MANUAL_URL`·`GH_ARS_MANUAL_TOKEN` 설정 후 `.\scripts\go.ps1 test -tags manual -run TestManual -v ./internal/github` | 통과 | 2026-09-07, repo `ax-by/test`, PAT(`repo` scope). 로그: scale set 생성(id=1) → 재사용(같은 id) → JIT(runnerID=22, len=4208, 값 미출력) → GetRunner found → RemoveRunner → not found → 재호출 nil → 세션 생성·Close → delete → 재삭제 `ErrScaleSetNotFound`. PASS 9.31s. 사후 `gh api .../actions/runners`에 `gh-ars-manual-*` 등록 없음 |
-| lite | Phase 7: local docker 머신 1대, none 모드 job 1개 완주 | 미실행 | |
+| lite | Phase 7: local docker 머신 1대, none 모드 job 1개 완주 | 통과 | 2026-09-08, Mac(arm64) + Docker Desktop 29.6.1(linux 엔진), repo `ax-by/test`, PAT. 시작: `image pulled` → `machine ready physicalMax=3 effectiveMax=3`(8GB/2Gi) → `scale set created id=2` → `capacity=2`. push → `unit creating` → `jit generated runnerID=23 jitLen=4144`(값 미출력) → `unit started` → `runner registered`(13s) → job success 37s → `runner died exitCode=0` → `runner registration absent` → `unit removed`. 실행 중 `docker inspect` Env·Args에 JIT 없음, `--cpus=1 --memory=2147483648`, 컨테이너 안 `.jitconfig` 없음(`docker exec` + job 로그 `jitconfig removed`). 이후 빈 폴링에서 재생성 없음. 종료 `controller stopped`, `scaleset delete lite` → `scale set deleted id=2`, 사후 runner·컨테이너 0. 관찰: JobCompleted(통계 0)가 die보다 150ms 먼저 와 `scale-down candidates present remove=1` 로그가 찍힘(Phase 11 축소 구현 전이라 로그만, die가 곧 뒤따라 정리). 재실행 시 `scale set found` 확인은 생략 |
 | 1 | none 모드 3대 spread + JIT 미노출 + 정리 순서 | 미실행 | |
 | 2 | sidecar docker/podman, docker build·container:·services: | 미실행 | |
 | 3 | 재시작 후 입양, 중복 생성 없음 | 미실행 | |
