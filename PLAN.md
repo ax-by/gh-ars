@@ -25,7 +25,7 @@
 | 5 | `runtime/docker` + `jittar` | §7.2-4 none 래퍼·tar, §9.1 볼륨·라벨, §4.2 라벨 | §4.2 | TESTPLAN (runtime/docker), (runtime/jittar). 실제 docker로 수동 확인 | 완료 2026-09-07 |
 | 6 | `github` | §7.1-5, §7.2-1·2·4, §8.3 등록 처리, §11, R7 | §4.4, §4.5 | TESTPLAN (github). 실제 repo에 ensure/JIT/GetRunner/RemoveRunner/delete 수동 확인 | 완료 2026-09-08 |
 | 7 | `controller` 최소(none, local, docker) + `cmd` — walking skeleton | §7 전체(none·local 범위), §8.3 정리 순서, §11 | §6, §9, §4.5 | TESTPLAN (controller/core). E2E-lite: 실제 repo에서 job 1개 완주(사람 실행) | 완료 2026-09-08 |
-| 8 | `executor/ssh` | §10.1, R20 | §4.1 | TESTPLAN (executor/ssh) | 미착수 |
+| 8 | `executor/ssh` | §10.1, R20 | §4.1 | TESTPLAN (executor/ssh) | 완료 2026-09-08 |
 | 9 | `runtime/podman` | §9.2 podman info 형식, §10.2 규칙 3 경로 | §4.2 | TESTPLAN (runtime/podman). Phase 0-3 결과 필요 | 미착수 |
 | 10 | `machine` 에이전트 | §7.1-3·4·7·8, §10.2, R16, R21, R22 | §7, §3.3 | TESTPLAN (machine) | 미착수 |
 | 11 | `controller` 확장: 입양·전체 동기화, tick 대조 완성, 축소(Draining), Dying 재시도, R24 | §7.2-3 축소, §8.3 전체, R24 | §6, §3.2 | TESTPLAN (controller/ext). E2E 1, 3, 4, 5 | 미착수 |
