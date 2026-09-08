@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"gh-ars/internal/domain"
 	"gh-ars/internal/executor"
@@ -35,10 +36,53 @@ type flavor interface {
 	// psFormat 은 `ps --format` 템플릿이다. 라벨은 gh-ars.* 키를 하나씩 뽑는다(docker.go 참조).
 	psFormat() string
 	parseContainer(line []byte) (Container, error)
+	// eventsFormat 은 `events --format` 값이다. docker 는 `{{json .}}`, podman 은 `json`
+	// 리터럴이다(§5, TESTPLAN (runtime/podman)).
+	eventsFormat() string
 	// parseEvent 는 관심 없는 줄(다른 type, 깨진 JSON)에 ok=false 를 돌려준다.
 	parseEvent(line []byte) (ev Event, ok bool)
 	parseInfo(out []byte) (Info, error)
 	isNotFound(stderr string) bool
+}
+
+// commonPSFormat 은 docker/podman 이 공유하는 `ps --format` 템플릿이다. 둘 다 같은 템플릿
+// 함수(.Names, .State, .CreatedAt, .Label)를 지원한다. [DESIGN §4.2]
+func commonPSFormat() string {
+	fields := []string{"{{.Names}}", "{{.State}}", "{{.CreatedAt}}"}
+	for _, k := range psLabelKeys {
+		fields = append(fields, `{{.Label "`+k+`"}}`)
+	}
+	return strings.Join(fields, psSepTemplate)
+}
+
+// parsePSLine 은 commonPSFormat 한 줄을 파싱한다. CreatedAt 레이아웃만 runtime마다 다르다
+// (docker: `dockerPSCreatedLayout`, podman: `podmanPSCreatedLayout`).
+func parsePSLine(line []byte, createdLayout string) (Container, error) {
+	fields := strings.Split(string(line), psSep)
+	if len(fields) != 3+len(psLabelKeys) {
+		return Container{}, fmt.Errorf("필드 %d개(기대 %d): %s", len(fields), 3+len(psLabelKeys), line)
+	}
+	if fields[0] == "" {
+		return Container{}, fmt.Errorf("Names 없음: %s", line)
+	}
+	created, err := time.Parse(createdLayout, fields[2])
+	if err != nil {
+		return Container{}, fmt.Errorf("CreatedAt %q: %w", fields[2], err)
+	}
+	labels := map[string]string{}
+	for i, k := range psLabelKeys {
+		if v := fields[3+i]; v != "" {
+			labels[k] = v
+		}
+	}
+	return Container{Name: fields[0], State: fields[1], Created: created, Labels: labels}, nil
+}
+
+// containsNotFoundMsg 는 docker/podman 이 공유하는 "이미 없음" 판별이다. 둘 다 stderr에
+// "no such container"/"no such volume"을 포함한다. [§8.3]
+func containsNotFoundMsg(stderr string) bool {
+	s := strings.ToLower(stderr)
+	return strings.Contains(s, "no such container") || strings.Contains(s, "no such volume")
 }
 
 // cli 는 docker/podman 공통 골격이다. argv 는 두 CLI 가 같고 파싱만 flavor 로 위임한다.
@@ -223,7 +267,7 @@ const eventsLineMax = 1 << 20
 func (c *cli) Events(ctx context.Context, labelFilter string) (<-chan Event, <-chan error) {
 	evCh := make(chan Event)
 	errCh := make(chan error, 1)
-	cmd := c.cmd(nil, "events", "--filter", "label="+labelFilter, "--filter", "type=container", "--format", jsonFormat)
+	cmd := c.cmd(nil, "events", "--filter", "label="+labelFilter, "--filter", "type=container", "--format", c.f.eventsFormat())
 	rc, err := c.ex.Stream(ctx, cmd)
 	if err != nil {
 		errCh <- fmt.Errorf("runtime: %s: %w", strings.Join(cmd.Argv, " "), err)

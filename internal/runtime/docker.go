@@ -38,34 +38,14 @@ const (
 // psFormat 은 라벨을 `{{.Label "key"}}` 로 하나씩 뽑는다. `{{json .}}` 의 Labels 는 "k=v,k=v"
 // 를 이스케이프 없이 이어붙인 문자열이라, 이미지가 물려준 라벨 값에 ",gh-ars.mode=none"
 // 같은 조각이 들어 있으면 실제 라벨을 덮어쓸 수 있다. 키별 템플릿은 이 모호함이 없다. [§4.2]
-func (dockerFlavor) psFormat() string {
-	fields := []string{"{{.Names}}", "{{.State}}", "{{.CreatedAt}}"}
-	for _, k := range psLabelKeys {
-		fields = append(fields, `{{.Label "`+k+`"}}`)
-	}
-	return strings.Join(fields, psSepTemplate)
-}
+func (dockerFlavor) psFormat() string { return commonPSFormat() }
 
 func (dockerFlavor) parseContainer(line []byte) (Container, error) {
-	fields := strings.Split(string(line), psSep)
-	if len(fields) != 3+len(psLabelKeys) {
-		return Container{}, fmt.Errorf("필드 %d개(기대 %d): %s", len(fields), 3+len(psLabelKeys), line)
-	}
-	if fields[0] == "" {
-		return Container{}, fmt.Errorf("Names 없음: %s", line)
-	}
-	created, err := time.Parse(dockerPSCreatedLayout, fields[2])
-	if err != nil {
-		return Container{}, fmt.Errorf("CreatedAt %q: %w", fields[2], err)
-	}
-	labels := map[string]string{}
-	for i, k := range psLabelKeys {
-		if v := fields[3+i]; v != "" {
-			labels[k] = v
-		}
-	}
-	return Container{Name: fields[0], State: fields[1], Created: created, Labels: labels}, nil
+	return parsePSLine(line, dockerPSCreatedLayout)
 }
+
+// eventsFormat: docker 는 `{{json .}}` 를 쓴다(podman 은 `json` 리터럴, podman.go 참조). [§5]
+func (dockerFlavor) eventsFormat() string { return jsonFormat }
 
 // dockerEvent 는 `docker events --format '{{json .}}'` 한 줄이다. 컨테이너 이름과 die 의
 // exitCode 는 Actor.Attributes 에 있다. [§4.2]
@@ -124,7 +104,4 @@ func (dockerFlavor) parseInfo(out []byte) (Info, error) {
 
 // isNotFound 는 docker rm / volume rm 의 "이미 없음" 응답이다. [§8.3]
 // docker 는 종료 코드로 구분하지 않으므로(둘 다 1) 메시지로 판별한다.
-func (dockerFlavor) isNotFound(stderr string) bool {
-	s := strings.ToLower(stderr)
-	return strings.Contains(s, "no such container") || strings.Contains(s, "no such volume")
-}
+func (dockerFlavor) isNotFound(stderr string) bool { return containsNotFoundMsg(stderr) }

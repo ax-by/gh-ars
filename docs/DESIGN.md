@@ -256,7 +256,7 @@ func NewDocker(ex executor.Executor, sudo bool) Runtime   // sudo 는 §10.2 판
 func NewPodman(ex executor.Executor, sudo bool) Runtime
 ```
 
-docker/podman 구현은 argv 조립과 출력 파싱만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`. `events`·`info`는 `--format '{{json .}}'`를 파싱한다. `ps`는 `{{json .}}`를 쓰지 않는다: 그 출력의 `Labels`는 "k=v,k=v"를 이스케이프 없이 이어붙인 문자열이라 이미지가 물려준 라벨 값에 `,gh-ars.mode=none` 같은 조각이 있으면 실제 라벨을 덮어쓸 수 있다. 대신 `{{.Names}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label "gh-ars.unit"}}…` 처럼 §4.2의 gh-ars.* 키 5개를 하나씩 뽑는 탭 구분 템플릿을 쓰고, `Container.Labels`에는 그 키만 담는다(입양 복원에 그것만 필요하다). 비0 종료는 `*ExitError{Argv, ExitCode, Stderr}`로 올리고, `Remove`/`VolumeRemove`는 "이미 없음" 응답을 성공으로 흡수한다(§8.3 멱등).
+docker/podman 구현은 argv 조립과 출력 파싱만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`. `info`는 두 runtime 모두 `--format '{{json .}}'`를 파싱한다. `events`는 docker만 `--format '{{json .}}'`를 쓰고, podman은 `--format json`(SPEC §5 명시)이다 — 둘 다 결과는 JSON Lines 한 줄씩이지만 podman의 이벤트 스키마 자체가 docker와 다르다(`flavor.eventsFormat()`으로 분기). `ps`는 `{{json .}}`를 쓰지 않는다: 그 출력의 `Labels`는 "k=v,k=v"를 이스케이프 없이 이어붙인 문자열이라 이미지가 물려준 라벨 값에 `,gh-ars.mode=none` 같은 조각이 있으면 실제 라벨을 덮어쓸 수 있다. 대신 `{{.Names}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label "gh-ars.unit"}}…` 처럼 §4.2의 gh-ars.* 키 5개를 하나씩 뽑는 탭 구분 템플릿을 쓰고, `Container.Labels`에는 그 키만 담는다(입양 복원에 그것만 필요하다). 비0 종료는 `*ExitError{Argv, ExitCode, Stderr}`로 올리고, `Remove`/`VolumeRemove`는 "이미 없음" 응답을 성공으로 흡수한다(§8.3 멱등).
 
 **sidecar 컨테이너 CreateSpec 값** [§9.1]:
 
