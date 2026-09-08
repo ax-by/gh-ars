@@ -86,6 +86,12 @@ if [ -n "$OVERRIDE" ]; then
 Override: $OVERRIDE"
 fi
 # 모델명은 적지 않는다. 세션마다 달라지고 커밋 기록만 낡는다.
+# 에이전트 세션 URL(Claude-Session 등)도 커밋 메시지에 넣지 않는다. 세션은 사라지고 링크만 기록에 남으며,
+# 커밋의 근거는 SPEC 절 번호와 PLAN.md 로 충분하다. --message 에 세션 URL 이 있으면 거부한다.
+if printf '%s' "$MESSAGE" | grep -qiE 'claude-session|claude\.ai/code/session'; then
+    echo "commit: 거부, --message 에 세션 URL 이 들어 있다 (커밋 메시지에 세션 URL 을 넣지 않는다)"
+    exit 1
+fi
 BODY="$BODY
 
 Co-Authored-By: Claude <noreply@anthropic.com>"

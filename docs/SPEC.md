@@ -222,7 +222,7 @@ machines:
 | R10 | `machines[].scaleSet` 참조 대상 없음 → 오류 |
 | R11 | 연결된 머신이 0개인 scale set → 오류 |
 | R12 | `runtime` 값이 `docker`/`podman` 외 → 오류 |
-| R13 | `runner.image` / `jobRuntime.image`가 `:latest` 또는 태그 없음 → 오류 |
+| R13 | `runner.image` / `jobRuntime.image`가 `:latest` 또는 태그 없음 → 오류. 다이제스트 참조(`@sha256:<64 hex>` / `@sha512:<128 hex>`)는 태그 유무와 무관하게 허용(다이제스트가 버전을 고정한다) |
 | R14 | `len(scaleSet.name) + len(machine.name) > 36` → 오류 (runner 이름 64자 제한) |
 | R15 | sidecar scale set에 연결된 머신의 runtime이 모두 같지 않음 → 오류. none scale set은 혼합 허용 |
 | R16 | sidecar scale set 머신 preflight: rootless podman / systemd 없음 / cgroup v2 아님 / cgroup 드라이버 systemd 아님 / 권한 부족(§10.2) → 오류. none scale set의 rootless podman은 허용 |
@@ -268,7 +268,8 @@ machines:
    ```
    `running`은 job을 받을 수 있거나 곧 받을 unit 수다: **Creating(기동 중) + Starting(등록 전) + Running + Draining**. Dying은 포함하지 않는다(단, 머신 slot 점유에는 포함. §8.3).
 
-   `pendingCompletion`은 job을 받았던(busy) unit이 `die`했지만 그 runner의 `JobCompleted`가 아직 도착하지 않은 runner 이름의 집합이다. listener는 빈 폴링(long-poll 만료)에도 직전 메시지의 `TotalAssignedJobs`를 캐시해 같은 값으로 desired 콜백을 부르므로, 통계가 아직 반영하지 않은 완료분을 이 집합으로 뺀다 — 그래서 빈 폴링에서 유휴 runner가 생기지 않는다. `die`와 `JobCompleted`는 어느 쪽이 먼저 와도 된다: `JobCompleted`가 먼저 오면 unit에 완료 표시만 남기고 그 unit의 `die`는 집합에 넣지 않으며, `die`가 먼저 왔으면 뒤따르는 `JobCompleted`가 집합에서 뺀다(이름 키라 중복 콜백에 멱등). 같은 메시지 안에서는 라이브러리가 `JobCompleted` 핸들러를 desired 콜백보다 먼저 부르므로, 통계가 줄어드는 메시지에서 집합도 함께 비워진다. 안전장치(주 메커니즘이 아니라 안전망): (1) 메시지 세션 재시작 시 집합을 비운다(초기 세션 통계가 새 기준선). 전체 동기화(§7.1-7)에서는 그 머신 소속 unit의 항목을 비운다. (2) 항목은 5분(§8.3 상수 표)이 지나면 버린다. 잔여 실패 모드는 일시적 1개 과소 배치이며 다음 `JobCompleted` 또는 만료에서 자가 치유된다.
+   `pendingCompletion`은 job을 받았던(busy) unit이 정리에 들어갔지만(`die`, 또는 §8.3의 미등록 판정 — job 종료 직후 등록이 `die`보다 먼저 사라지므로 tick이 먼저 볼 수 있다. 어느 경로든 Dying 전이 시점에 넣는다) 그 runner의 `JobCompleted`가 아직 도착하지 않은 runner 이름의 집합이다. listener는 빈 폴링(long-poll 만료)에도 직전 메시지의 `TotalAssignedJobs`를 캐시해 같은 값으로 desired 콜백을 부르므로, 통계가 아직 반영하지 않은 완료분을 이 집합으로 뺀다 — 그래서 빈 폴링에서 유휴 runner가 생기지 않는다. `die`와 `JobCompleted`는 어느 쪽이 먼저 와도 된다: `JobCompleted`가 먼저 오면 unit에 완료 표시만 남기고 그 unit의 `die`는 집합에 넣지 않으며, `die`가 먼저 왔으면 뒤따르는 `JobCompleted`가 집합에서 뺀다(이름 키라 중복 콜백에 멱등). 같은 메시지 안에서는 라이브러리가 `JobCompleted` 핸들러를 desired 콜백보다 먼저 부르므로, 통계가 줄어드는 메시지에서 집합도 함께 비워진다. 안전장치(주 메커니즘이 아니라 안전망): (1) 메시지 세션 재시작 시 집합을 비운다(초기 세션 통계가 새 기준선). 전체 동기화(§7.1-7)에서는 그 머신 소속 unit의 항목을 비운다. (2) 항목은 5분(§8.3 상수 표)이 지나면 버린다. 잔여 실패 모드는 일시적 1개 과소 배치이며 다음 `JobCompleted` 또는 만료에서 자가 치유된다.
+   `JobCompleted`의 runner 이름이 비어 있으면 RunnerID로 대조한다. 그 id를 아직 모르는 시점(JIT 결과 수신 전, 입양 unit의 첫 등록 확인 전)에 오면 id를 보관했다가 알게 될 때 적용한다(보관 상한도 5분).
    `create > 0`이면 그 수만큼: spread로 머신 선택 → unit id 발급 → `GenerateJitRunnerConfig(name=<scaleSet>-<machine>-<unit>)` → 컨테이너 실행.
    후보 머신 없음 → pending 유지. job은 GitHub 큐에서 대기(최대 24h). gh-ars는 취소하지 않는다.
 
@@ -336,7 +337,7 @@ capacity가 `X-ScaleSetMaxCapacity`로 보고된다. 적용 방식: none은 컨�
 | runner 컨테이너 살아 있는데 GitHub에 등록이 없음 (`GetRunnerByName(<scaleSet>-<machine>-<unit>)` 단건 조회, tick 30s마다. **Starting과 Running에 적용, Draining은 제외**) | Starting: 생성 후 grace(5분) 이내면 대기(등록 전 정상 구간). 초과면 unit 정리. Running: grace 없이 즉시 unit 정리(job 종료 직후 등록이 먼저 사라지는 정상 구간이므로 `die`가 곧 뒤따른다). Draining: 축소로 등록을 지운 상태이므로 `die`를 기다린다 |
 | Dying unit의 정리 명령 실패 | `Dying` 유지. 머신이 healthy면 매 tick(30s)마다 재시도(별도 백오프 없음). 머신이 unhealthy면 healthy 복귀 후 전체 동기화에서 정리. **부품이 남아 있는 동안 머신 slot을 계속 점유한 것으로 센다**(리소스가 실제로 잡혀 있고, 정리 실패가 과다 배치로 번지지 않게) |
 | runner 컨테이너가 `exited` 상태로 남아 있음 | unit 정리 |
-| runner 컨테이너 없는 sidecar/볼륨/slice (머신 내부 고아) | 항상 rm |
+| runner 컨테이너 없는 sidecar/볼륨/slice (머신 내부 고아) | 항상 rm. 구현은 부품 집합을 runner 이름 없는 Dying unit으로 등록해 아래 정리 순서(GitHub 단계 생략)·tick 재시도·slot 점유를 그대로 따른다 |
 | unit 정리 시 GitHub 등록 처리 (Dying, 기동 타임아웃, 재시작 후 exited 발견 모두 포함) | 컨테이너 rm **전에** `GetRunnerByName`으로 등록을 확인하고, 있으면 `RemoveRunner` 후 rm. `GetRunnerByName`이 미존재(`nil, nil`)를 돌려주거나 `RemoveRunner`가 `RunnerNotFoundError`를 돌려주면(`errors.Is`) 성공으로 취급(ephemeral runner는 보통 스스로 해제 후 종료) |
 
 **Creating 예외**: gh-ars가 지금 만들고 있는 unit(`Creating`)의 부품은 위 표의 판정 대상이 아니다. `create`→`cp`→`start`(§7.2-4)가 진행 중인 동안에는 slice·볼륨·sidecar만 있거나 runner가 `created` 상태인 것이 정상이라, 이를 고아나 짝이 안 맞는 unit으로 보면 자기가 만들던 unit을 지운다. 이 구간의 실패·기동 타임아웃 2분·`die`는 §7.2-4가 책임진다.
@@ -355,6 +356,7 @@ unit id를 알 수 없는 고아 등록(GenerateJIT 직후·컨테이너 create 
 | 완료 보정 만료 | 5분 | `pendingCompletion` 항목 유지 상한(§7.2-3). tick에서 판정 |
 | SSH 접속 타임아웃 | 10s | 접속·재접속 시도 1회당(§7.1-8, §10.1) |
 | runner 기동 타임아웃 | 2분 | create→cp→start 완료까지(§7.2-4) |
+| 정리 회차 상한 | 2분 | unit 정리(또는 startUnit 되돌리기) 1회 시도의 상한. 초과면 실패로 보고 Dying 유지, 다음 tick(30s)에서 재시도 |
 
 ## 9. sidecar 모드 상세
 

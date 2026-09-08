@@ -30,7 +30,7 @@ internal/controller/        Controller: 상태 소유 goroutine, listener.Scaler
 internal/logging/           slog 설정 (--log-level, --log-format)                                       [§11]
 ```
 
-의존 방향: `cmd → {controller, config, logging}`, `controller → {github, machine, plan, domain}`, `config → {domain, resource}`, `plan → {domain, resource, runtime(타입만)}`, `domain → resource`, `machine → {runtime, systemd, executor}`, `runtime → {executor, domain}`. `plan`, `domain`, `resource`는 I/O를 수행하지 않는다(`plan`이 `runtime.Container` 타입을 참조하는 것은 허용, 함수 호출은 금지).
+의존 방향: `cmd → {controller, config, github, logging}`, `controller → {github, machine, plan, domain, config, resource, runtime(타입만)}`, `config → {domain, resource}`, `plan → {domain, resource, runtime(타입만)}`, `domain → resource`, `machine → {runtime, systemd, executor, domain, resource}`, `runtime → {executor, domain}`. `plan`, `domain`, `resource`는 I/O를 수행하지 않는다(`plan`이 `runtime.Container` 타입을 참조하는 것은 허용, 함수 호출은 금지).
 
 ## 3. 도메인 모델
 
@@ -351,10 +351,12 @@ func (s *scaleSetScaler) HandleJobCompleted(ctx, *scaleset.JobCompleted) error /
 - 초기 세션의 `Statistics.TotalAssignedJobs`와 이후 **매 메시지**의 `TotalAssignedJobs`를 `HandleDesiredRunnerCount`에 넘긴다. 반환값은 메트릭 기록에만 쓴다.
 - **빈 폴링**(long-poll 만료, `msg == nil`)에도 직전 메시지의 `Statistics`를 캐시해 **같은** `TotalAssignedJobs`로 `HandleDesiredRunnerCount`를 부른다(`listener/listener.go` 189~190행). 콜백 인자만으로는 새 통계와 캐시를 구분할 수 없으므로 Controller는 §7.2-3의 `pendingCompletion` 보정으로 완료분을 뺀다.
 - 한 메시지 안의 호출 순서는 `DeleteMessage` → `AcquireJobs` → `HandleJobStarted`(각) → `HandleJobCompleted`(각) → `HandleDesiredRunnerCount`로 고정이다(`listener/listener.go` 207~237행). 완료를 반영한 통계와 그 `JobCompleted`는 같은 묶음에서 `JobCompleted`가 먼저 처리되므로, desired 계산 시점에 `pendingCompletion`은 이미 갱신돼 있다.
-- Controller는 scale set별 `pendingCompletion`(runner 이름 → 등록 시각)과 unit별 `Completed`를 보유한다. 갱신 지점: `msgJobCompleted`(unit이 살아 있으면 `Completed=true`, 이미 die 했으면 집합에서 제거), busy unit의 `die`(`Completed`면 넣지 않고, 아니면 집합에 추가), 세션 재시작(전부 비움), `msgResynced`(그 머신 소속 unit의 항목만 비움), `msgTick`(5분 만료 항목 제거, §8.3 상수 표). 이름 키라 중복 콜백에 멱등이다.
+- Controller는 scale set별 `pendingCompletion`(runner 이름 → {등록 시각, 머신, RunnerID})과 unit별 `Completed`를 보유한다. 갱신 지점: `msgJobCompleted`(unit이 살아 있으면 `Completed=true`, 이미 die 했으면 집합에서 제거), busy·미완료 unit의 **Dying 전이**(`die`, tick 미등록 판정, 기동 타임아웃, 시작 실패, 재동기화 — 전이 함수 하나(`markDying`)에서 `Completed`면 넣지 않고, 아니면 집합에 추가), 세션 재시작(`msgSessionStarted`, 전부 비움), `msgResynced`(그 머신 소속 항목만 비움 — 항목의 머신 필드로 판별), `msgTick`(5분 만료 항목 제거, §8.3 상수 표). 이름 키라 중복 콜백에 멱등이다.
+- RunnerID 대조: `JobCompleted`의 이름이 비면 살아 있는 unit의 id(`runnerIDs`, GenerateJIT 결과 또는 입양 unit의 첫 `GetRunner` 결과에서 `learnRunnerID`로 기록) → `pendingCompletion` 항목의 RunnerID 순으로 찾는다. 둘 다 없으면 `completedIDs`(RunnerID → 수신 시각)에 보관하고, `learnRunnerID`가 그 id를 알게 되는 시점에 적용한다(살아 있으면 `Completed=true`, 아니면 `pendingCompletion`에서 제거). `msgTick`이 5분 지난 항목을 버린다. [§7.2-3]
 - `SetMaxRunners(n)`은 atomic 저장이며 다음 `GetMessage`의 `maxCapacity`에 반영된다. [§7.2-1]
 - `listener.Config.Validate`는 `0 ≤ MaxRunners ≤ MaxInt32`를 요구한다. **MaxRunners 0이 허용**되므로 capacity 0인 scale set도 listener를 정상 시작하고, 운영 중 `SetMaxRunners(0)`도 허용된다. 중지·재시작 로직은 필요 없다.
-- 초기 세션의 `Statistics`가 nil이면 `Run`이 오류를 반환한다. Controller는 listener 오류를 로그 후 백오프(§7 백오프와 동일 수열)로 재시작한다.
+- 초기 세션의 `Statistics`가 nil이면 `Run`이 오류를 반환한다. Controller는 listener 오류를 로그 후 이전 세션을 닫고 백오프(§7 백오프와 동일 수열)로 재시작한다. "성공 시 리셋"의 성공은 세션이 백오프 최대값(30s) 이상 유지된 것으로 본다(`Run`은 오류로만 끝나므로 다른 성공 신호가 없다). 세션 (재)시작마다 `msgSessionStarted`를 보내 `pendingCompletion`을 비운다(§7.2-3 안전장치 1).
+- 세션은 `SetMaxRunners` 반영을 위해 `scaleSetState`가 원자 값(`capacity`, listener 핸들)으로 들고, listener goroutine은 생성 직후 저장된 capacity를 한 번 더 `SetMaxRunners`해 생성과 저장 사이의 변경을 흡수한다.
 
 ## 5. 순수 로직 (`internal/plan`)  [§8]
 
@@ -385,7 +387,7 @@ type Action struct {
 }
 ```
 
-**책임 경계 (tick vs Reconcile)**: GitHub 등록 대조는 `msgTick`에서만 한다. `Reconcile`은 재동기화 시점의 **부품 집합만** 판정한다. 그래서 `Observed`에 등록 여부가 없고, SPEC §8.3의 "runner 살아 있는데 등록 없음" 행은 `Reconcile`이 아니라 Controller의 tick 처리가 구현 주체다. 입양된 살아 있는 unit은 등록 여부를 보지 않고 `Starting`으로 들어가며(CreatedAt = 컨테이너 생성 시각), 다음 tick이 `GetRunner`로 `Running` 승격 또는 grace 초과 `Dying`을 판정한다(§3.2). `runtime.Container`를 입력으로 받기 위해 `plan → runtime`의 타입 의존이 생기지만 `runtime`의 I/O 함수는 호출하지 않는다.
+**책임 경계 (tick vs Reconcile)**: GitHub 등록 대조는 `msgTick`에서만 한다. `Reconcile`은 재동기화 시점의 **부품 집합만** 판정한다. 스냅샷에는 관측 시각이 있다(`machine.Snapshot.At` → `msgResynced.At`. `Observed`에는 없다): Controller는 그 시각 이후에 `Starting`이 된 unit을 §8.3 Creating 예외로 취급해 `known`에 `Creating`으로 넘긴다(스냅샷이 찍힐 때 만들던 중이었으므로 부품 부재가 정상이다). 그래서 `Observed`에 등록 여부가 없고, SPEC §8.3의 "runner 살아 있는데 등록 없음" 행은 `Reconcile`이 아니라 Controller의 tick 처리가 구현 주체다. 입양된 살아 있는 unit은 등록 여부를 보지 않고 `Starting`으로 들어가며(CreatedAt = 컨테이너 생성 시각), 다음 tick이 `GetRunner`로 `Running` 승격 또는 grace 초과 `Dying`을 판정한다(§3.2). `runtime.Container`를 입력으로 받기 위해 `plan → runtime`의 타입 의존이 생기지만 `runtime`의 I/O 함수는 호출하지 않는다.
 
 입양 시 `Unit.Machine`은 도달한 머신(`Observed.Machine`)이지만 `RunnerName`은 라벨의 `gh-ars.scaleSet`/`gh-ars.machine`으로 만든다. 등록은 생성 당시 이름으로 되어 있어 그 이름이라야 tick의 `GetRunner` 대조와 정리 시 `RemoveRunner`가 맞는다(§4.3, §8.3). `known`에 있고 `Creating`인 unit은 판정에서 제외한다(§8.3 Creating 예외).
 
@@ -416,7 +418,13 @@ type (
     msgJobCompleted struct{ ScaleSet, RunnerName string; RunnerID int64 } // listener HandleJobCompleted → Completed / pendingCompletion 갱신 [§7.2-3]
     msgDrainResult  struct{ Unit UnitID; Busy bool; Err error } // 비동기 RemoveRunner(축소) 결과
     msgCleanupDone  struct{ Unit UnitID; Err error }           // 비동기 cleanupUnit 결과
+    msgRegistration struct{ Unit UnitID; Found bool; RunnerID int64; Err error } // msgTick 이 goroutine 으로 뺀 GetRunner 결과. 판정 규칙은 msgTick 행
+    msgSessionStarted struct{ ScaleSet string }                 // 메시지 세션 (재)시작 → pendingCompletion 비움 [§7.2-3 안전장치 1]
 )
+
+`msgUnitStarted`는 `ScaleSet`·`RunnerName`·`RunnerID`도 싣는다: unit이 그 사이 죽었거나 정리됐어도 `pendingCompletion`·`completedIDs` 대조에 id가 필요하다(§4.5). `msgResynced`는 관측 시각 `At`를 싣는다(§5 책임 경계).
+
+Controller가 머신에 요구하는 것은 `MachineAgent` 인터페이스(`Name`, `Runtime`, `Preflight`, `Run`)다. 구현은 `*machine.Agent`, 테스트는 fake. 느린 작업은 전부 goroutine이며 루프에 넘길 값은 **루프에서 복사해** 넘긴다(goroutine 안에서 상태를 역참조하지 않는다).
 ```
 
 루프는 `select` 하나로 메시지를 처리한다. 메시지별 후속 동작:
@@ -427,12 +435,13 @@ type (
 | `msgDrainResult` | 성공: `Draining` 유지, `die`를 기다린다. `Busy`(IsBusy) 또는 기타 오류: `Running`으로 복귀(오류는 로그). unit이 이미 `Dying`이면 무시. [§7.2-3] |
 | `msgJobStarted` | RunnerName으로 unit을 찾아 `Busy=true`. 못 찾으면 로그만. |
 | `msgJobCompleted` | RunnerName(비면 RunnerID)으로 unit을 찾는다. 살아 있으면 `Completed=true`. 없거나 이미 `Dying`/제거됐으면 그 scale set의 `pendingCompletion`에서 이름을 뺀다(없으면 무시). [§7.2-3] |
-| `msgEvent` (`die`, role=runner) | unit(Creating/Starting/Running/Draining 모두)을 `Dying`으로 → goroutine `cleanupUnit`. `Busy && !Completed`면 RunnerName을 `pendingCompletion`에 넣는다(등록 시각 기록). 그 뒤 `minRunners` 미달분만 보충하고 **assigned 기반 신규 생성은 하지 않는다**(§7.2-3 식의 귀결). [§7.2-3, §7.2-5] |
+| `msgEvent` (`die`, role=runner) | unit(Creating/Starting/Running/Draining 모두)을 `markDying`으로 `Dying`으로 → goroutine `cleanupUnit`. `markDying`은 Dying 전이의 유일한 경로이며 `Busy && !Completed`면 RunnerName을 `pendingCompletion`에 넣는다(등록 시각·머신·RunnerID 기록) — tick 미등록 판정 등 다른 경로로 죽어도 같은 보정을 받는다. 그 뒤 `minRunners` 미달분만 보충하고 **assigned 기반 신규 생성은 하지 않는다**(§7.2-3 식의 귀결). 이미 `Dying`/정리된 unit의 die는 무시. [§7.2-3, §7.2-5] |
 | `msgEvent` (`die`, role=sidecar) | runner가 살아 있으면 로그만(runner die 시 함께 정리). |
 | `msgHealth` | 머신 health 갱신 → capacity 재계산 → `SetMaxRunners`. unhealthy 머신의 Dying unit은 정리를 보류한다. |
-| `msgResynced` | **부품은 스냅샷이 권위다.** `plan.Reconcile` 실행 **전에** 이 머신 소속 known unit의 `Parts`를 `Obs`가 보여준 부품 집합으로 덮어쓴다(정리 실패나 외부 rm으로 캐시가 어긋나면 §8.3의 slot 점유 계산이 틀어진다). `State`는 유지한다 — 상태 판정에는 GitHub 등록 대조가 필요해 `Reconcile`이 판정하지 않는다(§5 책임 경계). `Busy`도 유지한다 — 출처가 머신 이벤트가 아니라 메시지 세션(`msgJobStarted`)이라 SSH 단절로 낡지 않고, 되채우는 경로가 없어 리셋하면 남은 생애 동안 `false`로 고정된다. 그 다음 `Reconcile` 결과의 Adopt/RemoveUnit/RemoveOrphan을 적용한다(보류된 Dying 포함). 부품 집합만 판정하고 GitHub은 조회하지 않는다. 이 머신 소속 unit의 `pendingCompletion` 항목을 비운다(§7.2-3 안전장치). 머신 healthy 복귀. |
-| `msgTick` | **GitHub 등록 대조의 유일한 구현 주체.** Starting/Running unit마다 `GetRunner`로 대조(**Draining 제외**): Starting은 등록되면 `Running`, grace 초과면 `Dying`; Running은 미등록이면 `Dying`. `Creating`의 기동 타임아웃 판정. healthy 머신의 `Dying` unit 중 정리가 진행 중이 아닌 것은 `cleanupUnit` 재시도. `pendingCompletion`에서 5분 지난 항목 제거(§7.2-3 안전장치, §8.3 상수 표). [§8.3] |
-| `msgUnitStarted` | 성공: `Creating → Starting`. 실패: `Dying`으로 두고 `cleanupUnit`(역순 정리, RemoveRunner 포함). 다음 `msgDesired`에서 재배치. unit이 이미 `Dying`이면 무시. |
+| `msgResynced` | **부품은 스냅샷이 권위다.** `plan.Reconcile` 실행 **전에** 이 머신 소속 known unit의 `Parts`를 `Obs`가 보여준 부품 집합으로 덮어쓴다(정리 실패나 외부 rm으로 캐시가 어긋나면 §8.3의 slot 점유 계산이 틀어진다). `State`는 유지한다 — 상태 판정에는 GitHub 등록 대조가 필요해 `Reconcile`이 판정하지 않는다(§5 책임 경계). `Busy`도 유지한다 — 출처가 머신 이벤트가 아니라 메시지 세션(`msgJobStarted`)이라 SSH 단절로 낡지 않고, 되채우는 경로가 없어 리셋하면 남은 생애 동안 `false`로 고정된다. 그 다음 `Reconcile` 결과의 Adopt/RemoveUnit/RemoveOrphan을 적용한다(보류된 Dying 포함). RemoveOrphan은 unit id별로 모아 **runner 이름 없는 Dying unit**으로 등록한다(`Mode=sidecar`, `Foreign`, 관측된 Parts): `cleanupUnit`의 GitHub 단계만 건너뛰고 sidecar → 볼륨 → slice 순서, tick 재시도, slot 점유를 그대로 탄다(고아 등록은 GitHub이 자동 제거, §3.2). 관측 시각(`At`) 이후 `Starting`이 된 unit은 Creating 예외(§5). 부품 집합만 판정하고 GitHub은 조회하지 않는다. 이 머신 소속 `pendingCompletion` 항목을 비운다(§7.2-3 안전장치). 머신 healthy 복귀. |
+| `msgTick` | **GitHub 등록 대조의 유일한 구현 주체.** Starting/Running unit(**Draining 제외**, 대조가 진행 중이 아닌 것)을 모아 goroutine이 `GetRunner`를 부르고 결과를 `msgRegistration`으로 돌려보낸다(루프 안에서 GitHub을 부르지 않는다). `Creating`의 기동 타임아웃 판정. healthy 머신의 `Dying` unit 중 정리가 진행 중이 아닌 것은 `cleanupUnit` 재시도. `pendingCompletion`·`completedIDs`에서 5분 지난 항목 제거(§7.2-3 안전장치, §8.3 상수 표). [§8.3] |
+| `msgRegistration` | `Found`면 `learnRunnerID`(§4.5). Starting: 등록되면 `Running`, 미등록이고 grace 초과면 `Dying`, 이내면 대기. Running: 미등록이면 grace 없이 `Dying`. 오류는 로그만(다음 tick 재시도). unit이 그 사이 다른 상태가 됐으면 무시. [§8.3] |
+| `msgUnitStarted` | 먼저 `learnRunnerID`(unit이 이미 죽었거나 정리됐어도 id는 `pendingCompletion`·`completedIDs` 대조에 쓴다). 성공: `Creating → Starting`(전이 시각 기록 — §5 Creating 예외 판정용). 실패: `Dying`으로 두고 `cleanupUnit`(역순 정리, RemoveRunner 포함). 다음 `msgDesired`에서 재배치. unit이 이미 `Dying`이면 상태는 바꾸지 않는다. |
 | `msgCleanupDone` | 성공: `Removed`(상태에서 삭제, slot 해제). 실패: `Dying` 유지, 다음 tick에서 재시도. |
 
 `startUnit` (goroutine, 상태를 직접 만지지 않는다) [§7.2-4]:
@@ -440,13 +449,15 @@ type (
 JIT 생성(GitHub) → [sidecar: slice Create, 볼륨 3개 Create, sidecar 컨테이너 Create+Start]
 → runner 컨테이너 Create(entrypoint 래퍼, 라벨, 리소스) → CopyIn(jittar) → Start
 ```
-전체에 2분 타임아웃 컨텍스트. 실패 시 §3.2 정리 순서(GetRunner → RemoveRunner 포함)로 만든 부품을 정리하고 `msgUnitStarted{Err}`.
+전체에 2분 타임아웃 컨텍스트. 실패 시 §3.2 정리 순서(GetRunner → RemoveRunner 포함)로 만든 부품을 정리하고(분리한 ctx, 정리 회차 상한 2분) `msgUnitStarted{Err}`. 단 **프로세스 종료(부모 ctx 취소)로 중단된 경우는 되돌리지 않는다** — 컨테이너가 이미 start 됐을 수 있고 §7.3은 실행 중 컨테이너를 kill하지 않는다. 재시작 시 입양 또는 exited 정리(§8.3).
 
-`cleanupUnit` (goroutine): §3.2 정리 순서 실행 → `msgCleanupDone{Err}`. 실패해도 부분 정리된 부품은 다음 시도에서 건너뛴다(각 단계는 "없으면 성공"으로 멱등).
+`cleanupUnit` (goroutine): §3.2 정리 순서 실행(1회 시도 상한 2분, §8.3 상수 표) → `msgCleanupDone{Err}`. 실패해도 부분 정리된 부품은 다음 시도에서 건너뛴다(각 단계는 "없으면 성공"으로 멱등). RunnerName이 빈 unit(고아 부품 집합)은 GitHub 단계를 건너뛴다.
 
 ## 7. Machine 에이전트 (`internal/machine`)  [§7.1, §10]
 
 머신마다 goroutine 하나. 책임: 접속 유지, preflight, pre-pull, `Events` 스트림 수신 → `msgEvent`, 단절 시 백오프 재접속 → 재접속 후 `Observe()`(ps -a, 볼륨, slice) → `msgResynced`. Controller는 `Agent.Runtime()`, `Agent.Slices()`로 명령을 보낸다.
+
+`Run(ctx, sink)`의 회차: `Events` 열기 → `info`(데몬 생존) → `Observe`(관측 시각 기록) → `Resynced` → 스트림 소비. **events를 먼저 열고 관측한다**(반대면 그 사이의 die를 놓친다). 열기 직후 스트림이 이미 끝나 있으면 `Resynced`를 보내지 않고 실패로 본다(백오프 리셋 없음). 스트림이 끝나면 `Unhealthy` → 백오프 → 다음 회차. 첫 회차는 `Resynced` 또는 `Unhealthy` 중 하나를 반드시 보내며, Controller는 시작 시 머신마다 그 첫 통지를 기다린 뒤 메시지 세션을 연다(§7.1-7·8 → §7.1-9 순서. 첫 desired로 만든 unit의 die를 events가 받아야 한다). 시작 시 §7.1-7 동기화도 이 첫 회차의 `Resynced`다.
 
 preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 1. SSH 머신: host key 검증 후 접속(타임아웃 10s). local: 생략.
