@@ -40,11 +40,14 @@ type flavor interface {
 	// eventsFormat 은 `events --format` 값이다. docker 는 `{{json .}}`, podman 은 `json`
 	// 리터럴이다(§5, TESTPLAN (runtime/podman)).
 	eventsFormat() string
-	// parseEvent 는 우리 이벤트(ok=true)와 읽지 못한 줄(err != nil)을 구분한다. 구독이
-	// `--filter type=container` 로 좁혀져 있어 지금은 "관심 없는 줄"(ok=false, err=nil)이
-	// 생기지 않는다 — 다른 type 이나 이름 없는 줄이 오면 그 자체가 스키마 어긋남이다. 구분이
-	// 필요한 이유는 스키마가 어긋났을 때 모든 줄이 조용히 버려지면 die 가 영영 오지 않는데
-	// 아무 신호도 남지 않기 때문이다. 필터가 없어지면 ok=false 갈래가 다시 살아난다. [§7.2-5, §4.2]
+	// parseEvent 의 두 값은 독립이다:
+	//   ok  — 이 줄을 이벤트로 전달할 수 있는가
+	//   err — 스키마가 기대와 달랐는가(집계·경고 대상)
+	// 그래서 세 조합이 실제로 쓰인다: 정상(true, nil), 못 읽음(false, err), **읽었지만 일부가
+	// 이상함(true, err)**. 마지막이 필요한 이유는 die 를 버리는 것이 더 나쁘기 때문이다 — 예를
+	// 들어 exitCode 속성이 정수가 아니어도 die 자체는 전달해야 unit 정리가 제때 돈다(§7.2-5).
+	// 구독이 `--filter type=container` 로 좁혀져 있어 "관심 없는 줄"(false, nil)은 지금 생기지
+	// 않는다. 필터가 없어지면 그 갈래가 다시 살아난다. [§7.2-5, §4.2]
 	parseEvent(line []byte) (ev Event, ok bool, err error)
 	parseInfo(out []byte) (Info, error)
 	isNotFound(stderr string) bool
@@ -212,7 +215,12 @@ func createArgs(spec CreateSpec) ([]string, error) {
 	for _, k := range sortedKeys(spec.Labels) {
 		args = append(args, "--label", k+"="+spec.Labels[k])
 	}
-	// [§9.3 표] none 모드 예산. 0 이면 미지정(sidecar 모드는 slice 가 예산을 쥔다).
+	// [§9.3 표] 예산은 slice(sidecar) 아니면 개별 플래그(none) 중 하나가 쥔다. 둘을 함께 내면
+	// 같은 자원에 두 상한이 걸려 어느 쪽이 실제 한도인지 알 수 없다 — argv 를 만들기 전에 막는다.
+	if spec.CgroupParent != "" && (spec.CPUs > 0 || spec.MemoryBytes > 0) {
+		return nil, fmt.Errorf("runtime: CgroupParent 와 CPUs/MemoryBytes 는 함께 쓸 수 없다(slice 가 예산을 쥔다): %s", spec.Name)
+	}
+	// none 모드 예산. 0 이면 미지정(sidecar 모드는 slice 가 예산을 쥔다).
 	if spec.CPUs > 0 {
 		args = append(args, "--cpus="+strconv.FormatFloat(spec.CPUs, 'f', -1, 64))
 	}
@@ -320,21 +328,29 @@ func (c *cli) Events(ctx context.Context, labelFilter string) (<-chan Event, <-c
 		// 읽지 못한 줄은 건너뛰되(한 줄 때문에 스트림을 끊으면 재시작 사이에 die 를 놓친다) 세어
 		// 두었다가 종료 오류에 함께 싣는다. 스키마가 통째로 어긋나면 이벤트가 하나도 오지 않는데,
 		// 그 상태가 "조용한 정상" 과 구분되지 않으면 진단할 방법이 없다. [§7.1-8, §7.2-5]
-		bad, lastBad := 0, error(nil)
+		// odd 는 스키마가 기대와 다른 줄이다(버려진 줄 + 전달했지만 일부가 이상한 줄).
+		odd, lastOdd := 0, error(nil)
+		// withOdd 는 종료 사유에 집계를 붙인다. ctx 취소로 끝나도 집계를 잃지 않는다.
+		withOdd := func(err error) error {
+			if odd == 0 {
+				return err
+			}
+			return fmt.Errorf("%w (스키마가 어긋난 줄 %d개, 마지막: %v)", err, odd, lastOdd)
+		}
 		for sc.Scan() {
 			ev, ok, perr := c.f.parseEvent(sc.Bytes())
 			if perr != nil {
-				bad++
-				lastBad = perr
-				if bad == 1 {
+				// 이벤트를 살릴 수 있으면(ok) 전달까지 하고, 이상 신호는 따로 센다.
+				odd++
+				lastOdd = perr
+				if odd == 1 {
 					// 첫 줄은 즉시 알린다. 스키마가 통째로 어긋나면 스트림은 정상적으로 열린 채
 					// 며칠씩 유지되고 모든 줄이 버려지는데, 종료 오류만으로는 그 신호가 영영
 					// 나오지 않는다(§7.1-8 의 재시작 트리거가 오지 않는다). 이후는 종료 오류의
 					// 집계로 갈음한다. [DESIGN §4.2]
-					c.log.Warn("runtime: events 줄을 읽지 못했다(스키마 불일치일 수 있다)",
-						"runtime", c.kind, "err", perr)
+					c.log.Warn("runtime: events 줄의 스키마가 기대와 다르다",
+						"runtime", c.kind, "delivered", ok, "err", perr)
 				}
-				continue
 			}
 			if !ok {
 				continue
@@ -342,7 +358,7 @@ func (c *cli) Events(ctx context.Context, labelFilter string) (<-chan Event, <-c
 			select {
 			case evCh <- ev:
 			case <-ctx.Done():
-				errCh <- ctx.Err()
+				errCh <- withOdd(ctx.Err())
 				return
 			}
 		}
@@ -350,11 +366,7 @@ func (c *cli) Events(ctx context.Context, labelFilter string) (<-chan Event, <-c
 		if err == nil {
 			err = io.EOF
 		}
-		msg := fmt.Errorf("runtime: %s 스트림 종료: %w", strings.Join(cmd.Argv, " "), err)
-		if bad > 0 {
-			msg = fmt.Errorf("%w (읽지 못한 줄 %d개, 마지막 오류: %v)", msg, bad, lastBad)
-		}
-		errCh <- msg
+		errCh <- withOdd(fmt.Errorf("runtime: %s 스트림 종료: %w", strings.Join(cmd.Argv, " "), err))
 	}()
 	return evCh, errCh
 }

@@ -76,10 +76,19 @@ func (dockerFlavor) parseEvent(line []byte) (Event, bool, error) {
 		return Event{}, false, fmt.Errorf("runtime: docker event 이름 없음: %s", line)
 	}
 	ev := Event{Name: name, Action: e.Action, At: time.Unix(0, e.TimeNano)}
-	if s, ok := e.Actor.Attributes["exitCode"]; ok {
-		if code, err := strconv.Atoi(s); err == nil {
-			ev.ExitCode = code
+	s, has := e.Actor.Attributes["exitCode"]
+	if !has && e.Action == ActionDie {
+		// podman 쪽과 같은 규칙: 전달하되 0(정상 종료)으로 단정하지 않는다. [§7.2-5, DESIGN §4.2]
+		return ev, true, fmt.Errorf("runtime: docker die 이벤트에 exitCode 속성이 없다: %s", line)
+	}
+	if has {
+		code, err := strconv.Atoi(s)
+		if err != nil {
+			// 이벤트는 전달한다(die 를 버리면 정리가 늦어진다). 다만 조용히 0(정상 종료)으로
+			// 보고하지는 않는다: 스키마 어긋남으로 세어 신호를 남긴다. [§7.2-5, DESIGN §4.2]
+			return ev, true, fmt.Errorf("runtime: docker event exitCode %q 를 읽지 못했다: %s", s, line)
 		}
+		ev.ExitCode = code
 	}
 	return ev, true, nil
 }
@@ -92,7 +101,13 @@ type dockerInfo struct {
 	CgroupDriver  string   `json:"CgroupDriver"`
 	CgroupVersion string   `json:"CgroupVersion"`
 	ServerErrors  []string `json:"ServerErrors"`
+	// SecurityOptions 는 rootless 여부를 담는다: rootless 데몬은 "name=rootless" 항목을 낸다.
+	// docker 에는 podman 의 Host.Security.Rootless 같은 전용 필드가 없다. [§9.2]
+	SecurityOptions []string `json:"SecurityOptions"`
 }
+
+// dockerRootlessOption 은 `docker info` 의 SecurityOptions 에서 rootless 데몬을 가리키는 항목이다.
+const dockerRootlessOption = "name=rootless"
 
 func (dockerFlavor) parseInfo(out []byte) (Info, error) {
 	var i dockerInfo
@@ -108,9 +123,16 @@ func (dockerFlavor) parseInfo(out []byte) (Info, error) {
 		// 올려 unhealthy(재시도 가능)로 두는 편이 맞다. [§7.1-3, R21]
 		return Info{}, fmt.Errorf("runtime: docker info 에 예산이 없다(NCPU=%d, MemTotal=%d)", i.NCPU, i.MemTotal)
 	}
+	rootless := false
+	for _, opt := range i.SecurityOptions {
+		if strings.Contains(opt, dockerRootlessOption) {
+			rootless = true
+		}
+	}
 	return Info{
 		CPUs:          float64(i.NCPU),
 		MemoryBytes:   i.MemTotal,
+		Rootless:      rootless,
 		CgroupDriver:  i.CgroupDriver,
 		CgroupVersion: i.CgroupVersion,
 	}, nil

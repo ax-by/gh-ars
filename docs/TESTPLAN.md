@@ -26,7 +26,7 @@
 - (executor/ssh) keepalive 판정(상태 기계): 실패는 miss 증가, 성공은 리셋, **응답 없는 프로브는 주기마다 miss**, 상한 도달 시 단절. stop 시 루프 종료 (§10.1, §8.3).
 - (executor/ssh) known_hosts 재시도 목록에서 RSA 항목은 `rsa-sha2-256/512`로 펼친다(OpenSSH 8.8+ 는 SHA-1 서명을 끈다) (§10.1, R20).
 - (executor/local) `Cmd.Sudo` 접두, stdin 전달, Stream 종료 통지 (§5).
-- (runtime/docker) docker argv 조립과 출력 파싱: ps -a 라벨 필터, none create 플래그(--cpus/--memory, 라벨, entrypoint 래퍼), events JSON 정규화, `Info` 파싱 (DESIGN §4.2).
+- (runtime/docker) `Info`의 rootless 판정(`SecurityOptions`의 `name=rootless`), docker argv 조립과 출력 파싱: ps -a 라벨 필터, none create 플래그(--cpus/--memory, 라벨, entrypoint 래퍼), events JSON 정규화, `Info` 파싱 (DESIGN §4.2).
 - (runtime/docker), (runtime/podman) 읽지 못한 줄 판정: 깨진 JSON·`type != container`·이름 없음은 전부 이상 신호이며, 첫 줄은 즉시 경고 로그, 집계는 스트림 종료 오류에 실린다 (DESIGN §4.2).
 - (runtime/podman) podman과 docker의 차이: events JSON 필드(**픽스처는 실제 podman 출력을 캡처한 것이어야 한다** — 지어낸 스키마는 파서가 모든 줄을 버려도 통과한다), 시각 필드의 정수·문자열 양쪽 수용, 읽지 못한 줄이 스트림 종료 오류에 실리는지, `Info`의 `v2` → `2`·`Rootless`, `Cmd.Sudo` 접두 전파 (DESIGN §4.2, §10.2 규칙 3).
 - (runtime/sidecar) sidecar create 플래그(--cgroup-parent, --privileged, 볼륨 3개 마운트 경로, dind/podman 명령·env)와 runner 컨테이너의 `DOCKER_HOST`/`CONTAINER_HOST` (§9.1, DESIGN §4.2 표).
@@ -34,7 +34,7 @@
 - (systemd) set-property/stop/revert argv, `Check`의 sudo 분기 (§9.3, §10.2).
 - (github) `CheckAuth`가 그룹 조회로 인증을 확인하고(`Default` 정규화 포함) 실패를 그대로 올린다 (§7.1-2, R7).
 - (github) `GetRunner`의 `(nil, nil)` → found=false, `RemoveRunner`의 `RunnerNotFoundError` → nil, `IsBusy` 판정, `Default` 대소문자 무시 (§8.3, R7).
-- (machine) podman 경로 고정 규칙(§10.2 규칙 3)의 none/sidecar 분기, `id -u` 분기, R16 판정.
+- (machine) podman 경로 고정 규칙(§10.2 규칙 3)의 none/sidecar 분기, `id -u` 분기, R16 판정(rootless docker·podman, cgroup, systemctl).
 - (machine) R21 재접속 후 위반 → Failed(재접속 중단).
 - (machine) 재접속 백오프 수열(1s→2s→…→30s cap, jitter 범위, 성공 시 리셋) (§7.1-8).
 - (controller/core) 시작 순서: 인증 확인(§7.1-2)이 preflight·pre-pull보다 앞. 인증 실패면 pull·scale set 확보 없이 시작 실패.

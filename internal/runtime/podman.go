@@ -111,6 +111,9 @@ func (podmanFlavor) parseEvent(line []byte) (Event, bool, error) {
 	ev := Event{Name: e.Name, Action: action, At: at}
 	if e.ContainerExitCode != nil {
 		ev.ExitCode = *e.ContainerExitCode
+	} else if action == ActionDie {
+		// docker 쪽과 같은 이유: 이벤트는 전달하되 0 으로 단정하지 않는다. [§7.2-5, DESIGN §4.2]
+		return ev, true, fmt.Errorf("runtime: podman die 이벤트에 ContainerExitCode 가 없다: %s", line)
 	}
 	return ev, true, nil
 }

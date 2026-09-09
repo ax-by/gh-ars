@@ -446,10 +446,10 @@ func TestDocker_S4_2_UnparseableLineSignal(t *testing.T) {
 		t.Fatalf("events = %+v, want die 1건", got)
 	}
 	err := <-errCh
-	if err == nil || !strings.Contains(err.Error(), "읽지 못한 줄 2개") {
+	if err == nil || !strings.Contains(err.Error(), "스키마가 어긋난 줄 2개") {
 		t.Fatalf("종료 오류에 집계가 없다: %v", err)
 	}
-	if n := strings.Count(logs.String(), "읽지 못했다"); n != 1 {
+	if n := strings.Count(logs.String(), "스키마가 기대와 다르다"); n != 1 {
 		t.Fatalf("경고 %d회, want 1 (첫 줄만 즉시, 나머지는 집계)", n)
 	}
 }
@@ -495,5 +495,68 @@ func TestDocker_S4_2_EventWithoutNameIsUnparseable(t *testing.T) {
 	_, ok, err = dockerFlavor{}.parseEvent([]byte(`{"Type":"network","Action":"connect","Actor":{"Attributes":{}}}`))
 	if ok || err == nil {
 		t.Fatalf("ok=%v err=%v, want 읽지 못한 줄", ok, err)
+	}
+}
+
+// TestDocker_S7_2_5_BadExitCodeStillDelivered: exitCode 속성이 정수가 아니면 조용히 0(정상 종료)
+// 으로 보고하지 않는다. 그렇다고 die 를 버리지도 않는다 — 버리면 unit 정리가 늦어진다. 이벤트는
+// 전달하고 이상은 따로 센다. [§7.2-5, DESIGN §4.2]
+func TestDocker_S7_2_5_BadExitCodeStillDelivered(t *testing.T) {
+	line := []byte(`{"Type":"container","Action":"die","Actor":{"Attributes":{"name":"gh-ars-X-runner","exitCode":"n/a"}},"timeNano":1}`)
+	ev, ok, err := dockerFlavor{}.parseEvent(line)
+	if !ok {
+		t.Fatal("die 이벤트를 버렸다")
+	}
+	if err == nil {
+		t.Fatal("읽지 못한 exitCode 가 신호로 남지 않았다")
+	}
+	if ev.Action != ActionDie || ev.ExitCode != 0 {
+		t.Fatalf("event = %+v", ev)
+	}
+}
+
+// TestCreateArgs_S9_3_SliceAndPerContainerBudgetAreExclusive: 예산은 slice(sidecar) 아니면
+// 개별 플래그(none) 중 하나가 쥔다. 둘을 함께 내면 같은 자원에 두 상한이 걸린다. [§9.3 표]
+func TestCreateArgs_S9_3_SliceAndPerContainerBudgetAreExclusive(t *testing.T) {
+	base := CreateSpec{Name: "gh-ars-X-runner", Image: "img", Entrypoint: []string{"/bin/bash"}}
+	sidecar := base
+	sidecar.CgroupParent = "gh-ars-X.slice"
+	if _, err := createArgs(sidecar); err != nil {
+		t.Fatalf("slice 만 있는 spec 이 거부됐다: %v", err)
+	}
+	none := base
+	none.CPUs, none.MemoryBytes = 2, 1<<30
+	if _, err := createArgs(none); err != nil {
+		t.Fatalf("개별 예산만 있는 spec 이 거부됐다: %v", err)
+	}
+	both := sidecar
+	both.CPUs = 2
+	if _, err := createArgs(both); err == nil {
+		t.Fatal("slice 와 --cpus 를 함께 낸 spec 이 통과했다")
+	}
+	both = sidecar
+	both.MemoryBytes = 1 << 30
+	if _, err := createArgs(both); err == nil {
+		t.Fatal("slice 와 --memory 를 함께 낸 spec 이 통과했다")
+	}
+}
+
+// TestDocker_S9_2_RootlessDetection: docker 에는 podman 의 Host.Security.Rootless 같은 필드가
+// 없고 SecurityOptions 의 "name=rootless" 로 드러난다. sidecar 전제(§9.2 "rootful docker")를
+// 판정하려면 이 값이 필요하다.
+func TestDocker_S9_2_RootlessDetection(t *testing.T) {
+	f, rt := newDockerFake(t)
+	f.results = []executor.Result{{Stdout: []byte(`{"NCPU":8,"MemTotal":17179869184,"CgroupDriver":"systemd","CgroupVersion":"2","SecurityOptions":["name=seccomp,profile=builtin","name=rootless"]}`)}}
+	got, err := rt.Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info: %v", err)
+	}
+	if !got.Rootless {
+		t.Fatalf("rootless docker 를 못 알아봤다: %+v", got)
+	}
+	f.results = []executor.Result{{Stdout: []byte(`{"NCPU":8,"MemTotal":17179869184,"CgroupDriver":"systemd","CgroupVersion":"2","SecurityOptions":["name=seccomp,profile=builtin"]}`)}}
+	got, err = rt.Info(context.Background())
+	if err != nil || got.Rootless {
+		t.Fatalf("rootful 인데 Rootless=%v (err=%v)", got.Rootless, err)
 	}
 }

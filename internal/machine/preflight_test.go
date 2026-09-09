@@ -370,6 +370,27 @@ func TestPreflight_R16_PodmanRootlessSidecar(t *testing.T) {
 	})
 }
 
+// TestPreflight_R16_RootlessDocker: sidecar 전제는 rootful runtime 이다(§9.2). podman 은 경로
+// 고정에서 걸리지만 docker 는 여기가 유일한 판정 지점이다. [R16, §9.2]
+func TestPreflight_R16_RootlessDocker(t *testing.T) {
+	ex := &fakeExec{h: uid("1000", func(_ bool, argv []string) (executor.Result, error) {
+		if isCmd(argv, "docker", "info") {
+			return ok(`{"NCPU":8,"MemTotal":17179869184,"CgroupDriver":"systemd","CgroupVersion":"2","SecurityOptions":["name=rootless"]}`)
+		}
+		return executor.Result{}, nil
+	})}
+	a := newAgent(t, Spec{Name: "m1", Local: true, Runtime: domain.RuntimeDocker, Mode: domain.ModeSidecar,
+		NewSlices: noSlices}, ex)
+	if _, err := a.Preflight(context.Background()); !errors.Is(err, ErrFatal) {
+		t.Fatalf("rootless docker + sidecar 는 R16 오류여야 한다: %v", err)
+	}
+	// none 모드에서는 허용된다(§9.2 는 sidecar 전제다).
+	a2 := newAgent(t, Spec{Name: "m1", Local: true, Runtime: domain.RuntimeDocker, Mode: domain.ModeNone}, ex)
+	if _, err := a2.Preflight(context.Background()); err != nil {
+		t.Fatalf("none 모드는 rootless docker 를 허용한다: %v", err)
+	}
+}
+
 // TestPreflight_R16_CgroupMismatch: sidecar 전제는 cgroup v2 + systemd 드라이버다. [R16, §9.2]
 func TestPreflight_R16_CgroupMismatch(t *testing.T) {
 	for _, tc := range []struct{ driver, version string }{

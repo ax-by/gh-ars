@@ -481,7 +481,7 @@ preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 3. runtime `info`:
    - docker: `docker info`(sudo 없음). 실패 → none은 unhealthy, sidecar는 R16 오류.
    - podman: `podman info` → 실패면 `sudo -n podman info`(모드 무관). 성공한 경로를 `Machine.Sudo`로 고정. 둘 다 실패 → none은 unhealthy, sidecar는 R16 오류. sidecar이고 고정 경로의 `Rootless=true`면 아직 시도하지 않은 `sudo -n podman info`를 시도해 rootful이면 `Sudo=true`로 바꾸고, 그래도 rootless면 R16 오류. [§10.2 규칙 3]
-4. sidecar scale set이면: `CgroupDriver == systemd && CgroupVersion == 2` 확인, `Slices.Check()`(root 아니면 sudo -n) → 실패 시 R16 오류.
+4. sidecar scale set이면: rootful 확인(`Info.Rootless == false` — podman은 3단계에서 이미 걸리고 docker는 여기가 유일한 판정 지점이다), `CgroupDriver == systemd && CgroupVersion == 2` 확인, `Slices.Check()`(root 아니면 sudo -n) → 실패 시 R16 오류.
 5. resources: 생략 시 `info`의 CPUs/MemoryBytes, 명시 시 탐지값으로 cap(R21 경고). physicalMax·effectiveMax 계산(R21 오류, R22 경고).
 6. pre-pull: runner 이미지, sidecar면 sidecar 이미지. 실패 → unhealthy.
 

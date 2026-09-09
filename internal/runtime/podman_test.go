@@ -121,7 +121,7 @@ func TestPodman_S4_2_EventsNormalize(t *testing.T) {
 		`not json at all`,
 		`{"ContainerExitCode":3,"ID":"52c7276fc13f","Image":"docker.io/library/alpine:3.20","Name":"gh-ars-X-runner","Status":"died","time":1788934694,"timeNano":1788934694175539027,"Type":"container","Attributes":{"gh-ars.unit":"X"}}`,
 		// 구버전·문서 형식(RFC3339 문자열 "Time")도 계속 읽는다.
-		`{"ID":"683b0909d556","Name":"gh-ars-Y-runner","Status":"died","Time":"2019-04-27T22:47:05.212629470-04:00","Type":"container"}`,
+		`{"ID":"683b0909d556","ContainerExitCode":0,"Name":"gh-ars-Y-runner","Status":"died","Time":"2019-04-27T22:47:05.212629470-04:00","Type":"container"}`,
 		`{"ID":"n1","Name":"bridge","Status":"connect","time":1788934695,"Type":"network"}`,
 		"",
 	}, "\n")
@@ -154,7 +154,7 @@ func TestPodman_S4_2_EventsNormalize(t *testing.T) {
 	if !ok || err == nil {
 		t.Fatalf("스트림 종료 통지가 없다: ok=%v err=%v", ok, err)
 	}
-	if !strings.Contains(err.Error(), "읽지 못한 줄 2개") { // 깨진 JSON 1 + network 1
+	if !strings.Contains(err.Error(), "스키마가 어긋난 줄 2개") { // 깨진 JSON 1 + network 1
 		t.Fatalf("파싱 실패가 종료 오류에 실리지 않았다: %v", err)
 	}
 }
@@ -213,10 +213,26 @@ func TestEvents_S4_2_FirstUnparseableLineWarns(t *testing.T) {
 	for range evCh {
 	}
 	<-errCh
-	if !strings.Contains(logs.String(), "읽지 못했다") {
+	if !strings.Contains(logs.String(), "스키마가 기대와 다르다") {
 		t.Fatalf("첫 실패 줄에 대한 경고가 없다: %q", logs.String())
 	}
-	if n := strings.Count(logs.String(), "읽지 못했다"); n != 1 {
+	if n := strings.Count(logs.String(), "스키마가 기대와 다르다"); n != 1 {
 		t.Fatalf("경고 %d회, want 1 (이후는 종료 오류의 집계로 갈음)", n)
+	}
+}
+
+// TestPodman_S7_2_5_DieWithoutExitCodeStillDelivered: 종료 코드가 없는 die 는 0(정상)으로
+// 단정하지 않되 **이벤트 자체는 전달한다** — die 를 버리면 unit 정리가 tick 까지 늦어진다.
+// [§7.2-5, DESIGN §4.2]
+func TestPodman_S7_2_5_DieWithoutExitCodeStillDelivered(t *testing.T) {
+	ev, ok, err := podmanFlavor{}.parseEvent([]byte(`{"Type":"container","Status":"died","Name":"gh-ars-X-runner","time":1788934694}`))
+	if !ok {
+		t.Fatal("die 이벤트를 버렸다")
+	}
+	if err == nil {
+		t.Fatal("종료 코드 누락이 신호로 남지 않았다")
+	}
+	if ev.Action != ActionDie || ev.Name != "gh-ars-X-runner" {
+		t.Fatalf("event = %+v", ev)
 	}
 }

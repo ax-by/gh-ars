@@ -244,9 +244,9 @@ machines:
 2. GitHub 인증 및 scope 확인.
 3. 각 머신 preflight:
    - SSH 머신: host key 검증 후 접속. local 머신: SSH·host key 단계 생략.
-   - 설정된 runtime CLI 동작 확인(`docker info` / `podman info`). runtime을 탐지하지는 않는다.
+   - 설정된 runtime CLI 동작 확인(`docker info` / `podman info`, `--format '{{json .}}'` 한 번). runtime을 탐지하지는 않는다. 아래 항목들(예산 탐지, rootless, cgroup)은 모두 이 한 번의 결과에서 읽는다.
    - `machines[].resources` 생략 시 `info`로 CPU/메모리 자동 탐지, 명시 시 cap(R21). physicalMax·effectiveMax 계산(R22).
-   - podman이면 `podman info --format '{{.Host.Security.Rootless}}'`로 rootless 확인. sidecar scale set이면 R16의 systemd/cgroup/권한(§10.2) 확인.
+   - podman이면 같은 `info` 결과의 `host.security.rootless`로 rootless 확인. sidecar scale set이면 R16의 systemd/cgroup/권한(§10.2) 확인.
    - 분류: 설정·환경 모순(R16, R21 오류)은 **시작 실패**. 도달 불가·명령 실패는 **unhealthy**로 표시하고 배치에서 제외(프로세스는 계속, 재접속 시 재시도). 재접속 후 preflight에서 R16/R21 위반이 드러나면 시작 실패 대신 그 머신을 **`Failed`**(영구 제외, 재접속 안 함)로 두고 오류 로그.
 4. 이미지 pre-pull: 각 healthy 머신에 `runner.image`를 pull. sidecar scale set이면 `jobRuntime.image`(또는 runtime별 기본 이미지)도 pull. 실패 머신은 unhealthy. pull 하나가 상한(§8.3)을 넘기면 실패로 본다 — preflight는 그 머신의 첫 통지(§7.1-7)보다 앞이므로, 상한이 없으면 응답 없는 pull 하나가 모든 scale set의 세션 시작(§7.1-9)을 무한정 막고 재접속 회차도 같은 자리에서 멈춰 그 머신이 unhealthy에 갇힌다.
 5. scale set 확보: `runnerGroup`을 `GetRunnerGroupByName`으로 조회 → 그 그룹 안에서 이름으로 `GetRunnerScaleSet(groupID, name)` → 없으면 `CreateRunnerScaleSet`. 그룹 이동 분기는 없다.[^group] **종료 시 삭제하지 않는다.**
@@ -387,10 +387,10 @@ unit id를 알 수 없는 고아 등록(GenerateJIT 직후·컨테이너 create 
 - sidecar는 호스트 root와 동등한 권한을 가진다. CI 전용 머신에만 연결한다. **local 머신을 sidecar scale set에 연결하면 gh-ars 호스트에서 `--privileged` 컨테이너가 뜬다.** 공용 PC·노트북은 none scale set에만 연결한다.
 
 ### 9.2 전제 (preflight, R16)
-- rootful docker 또는 rootful podman. rootless podman → 오류.
-- cgroup v2 + systemd cgroup 드라이버:
-  - docker: `docker info --format '{{.CgroupDriver}} {{.CgroupVersion}}'` == `systemd 2`
-  - podman: `podman info --format '{{.Host.CgroupManager}} {{.Host.CgroupsVersion}}'` == `systemd v2` (podman이 `--cgroup-parent=<slice>`를 받으려면 systemd 매니저여야 한다)
+- rootful docker 또는 rootful podman. rootless면 오류. 판정은 위 `info` 결과에서 한다: podman은 `host.security.rootless`, docker는 `SecurityOptions`에 `name=rootless` 항목이 있는지로 본다(docker에는 전용 필드가 없다).
+- cgroup v2 + systemd cgroup 드라이버. preflight는 머신마다 `info --format '{{json .}}'`를 **한 번** 실행해 아래 필드를 읽는다(값만 규범이고 조회는 한 번으로 묶는다):
+  - docker: `CgroupDriver` == `systemd`, `CgroupVersion` == `2`
+  - podman: `host.cgroupManager` == `systemd`, `host.cgroupVersion` == `v2`(구현이 docker와 맞추어 `2`로 정규화한다). podman이 `--cgroup-parent=<slice>`를 받으려면 systemd 매니저여야 한다
 - `systemctl` 사용 가능(systemd 호스트). 정적 분할 fallback 없음.
 - §10.2 권한.
 
@@ -444,7 +444,7 @@ gh-ars는 root가 아닌 사용자로 실행할 때 root가 필요한 명령에�
 | runtime | mode | 요구 권한 | preflight 확인 |
 |---|---|---|---|
 | docker | none | `docker` 그룹 멤버 또는 root | `docker info` 성공 |
-| docker | sidecar | 위 + root 또는 passwordless sudo: `systemctl set-property/stop/revert` (`gh-ars-*.slice` 한정) | `sudo -n systemctl --version` 성공 |
+| docker | sidecar | 위 + rootful 데몬 + root 또는 passwordless sudo: `systemctl set-property/stop/revert` (`gh-ars-*.slice` 한정) | `info`의 `SecurityOptions`에 `name=rootless` 없음, `sudo -n systemctl --version` 성공 |
 | podman | none | rootless: 일반 사용자. rootful: root 또는 passwordless sudo `podman` | `podman info` 또는 `sudo -n podman info` 중 하나 성공(규칙 3) |
 | podman | sidecar | root 또는 passwordless sudo: `podman`, `systemctl set-property/stop/revert` | 규칙 3으로 고정된 경로의 `Rootless=false`, `sudo -n systemctl --version` 성공 |
 

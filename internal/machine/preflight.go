@@ -177,6 +177,12 @@ func (a *Agent) infoFailure(what string, err error) error {
 // checkSidecar 는 sidecar scale set 머신의 R16 전제다: cgroup v2 + systemd 드라이버, systemctl 사용 가능.
 // 미충족은 전부 R16 오류다. [R16, §9.2, §10.2 규칙 4]
 func (a *Agent) checkSidecar(ctx context.Context, ex executor.Executor, info runtime.Info, root bool) error {
+	// §9.2 첫 항목: rootful docker 또는 rootful podman. podman 은 경로 고정(규칙 3)에서 이미
+	// 걸리지만 docker 는 여기가 유일한 판정 지점이다(rootless docker 는 info 의 SecurityOptions
+	// 에 "name=rootless" 로 드러난다). [R16, §9.2]
+	if info.Rootless {
+		return fatalf("R16 머신 %q: sidecar 모드는 rootful runtime 이 필요하다(rootless 로 확인됨)", a.name)
+	}
 	if info.CgroupDriver != cgroupDriverSystemd || info.CgroupVersion != cgroupVersion2 {
 		return fatalf("R16 머신 %q: cgroup %s/%s, sidecar 모드는 %s/%s 가 필요하다",
 			a.name, info.CgroupDriver, info.CgroupVersion, cgroupDriverSystemd, cgroupVersion2)

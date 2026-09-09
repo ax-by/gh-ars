@@ -17,7 +17,7 @@ import (
 type Info struct {
 	CPUs          float64
 	MemoryBytes   int64
-	Rootless      bool   // podman 만 의미. docker 는 항상 false
+	Rootless      bool   // podman 은 Host.Security.Rootless, docker 는 SecurityOptions 의 "name=rootless" [§9.2]
 	CgroupDriver  string // "systemd" 기대
 	CgroupVersion string // "2" 기대. podman 의 "v2" 는 "2" 로 정규화
 }
