@@ -301,6 +301,12 @@ package github
 type RunnerRef struct{ ID int64; Name string }
 
 type Client interface {
+    // 시작 시 인증·scope 확인(§7.1-2). GetRunnerGroupByName 한 번으로 토큰 교환과 접근 권한을 확인한다.
+    // New 는 네트워크를 타지 않으므로(라이브러리가 URL 파싱·HTTP 구성만 한다) 이 호출이 첫 접촉이다.
+    // Controller 가 preflight·pre-pull 앞에서 부른다 — 없으면 잘못된 토큰이 §7.1-5 에서야 드러난다.
+    // 라이브러리가 그룹 미존재도 오류로 돌려주므로(v0.4.0 count 0 → error) 잘못된 runnerGroup 도 여기서 걸린다
+    // (§7.1-5 가 낼 오류를 앞당길 뿐이라 판정이 갈리지 않는다)
+    CheckAuth(ctx, runnerGroup string) error
     // GetRunnerGroupByName → GetRunnerScaleSet(groupID, name) → 없으면 CreateRunnerScaleSet. 그룹 이동 없음 [§7.1-5 각주]
     EnsureScaleSet(ctx, name, runnerGroup string) (id int, err error)
     // 같은 조회 경로 → DeleteRunnerScaleSet(id) [§11]

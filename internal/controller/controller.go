@@ -182,6 +182,12 @@ func (c *Controller) Run(ctx context.Context) error {
 		c.log.Warn(w)
 	}
 
+	// §7.1-2 GitHub 인증·scope 확인. preflight·pre-pull(머신 수 × 이미지당 최대 5분)보다 먼저 해서
+	// 잘못된 토큰이 그 시간을 다 쓴 뒤가 아니라 즉시 드러나게 한다.
+	if err := c.checkAuth(ctx); err != nil {
+		return err
+	}
+
 	// §7.1-3·4 preflight + pre-pull. 도달 불가·명령 실패는 unhealthy, 설정·환경 모순(R21)은 시작 실패.
 	for i := range c.machines {
 		m := &c.machines[i]
@@ -269,6 +275,20 @@ loop:
 	close(c.done)
 	c.wg.Wait()
 	c.log.Info("controller stopped")
+	return nil
+}
+
+// checkAuth 는 §7.1-2 다. scale set 하나의 runner group 을 조회하는 것으로 충분하다: 인증은
+// 자격 증명 하나가 전부이고, 나머지 그룹의 존재 여부는 §7.1-5 의 확보 단계가 판정한다.
+func (c *Controller) checkAuth(ctx context.Context) error {
+	if len(c.ssOrder) == 0 {
+		return nil
+	}
+	ss := c.scaleSets[c.ssOrder[0]]
+	if err := c.gh.CheckAuth(ctx, ss.RunnerGroup); err != nil {
+		return err
+	}
+	c.log.Info("github auth ok", "url", c.cfg.GitHub.URL, "runnerGroup", ss.RunnerGroup)
 	return nil
 }
 

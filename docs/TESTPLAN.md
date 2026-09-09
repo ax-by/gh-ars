@@ -26,10 +26,12 @@
 - (runtime/sidecar) sidecar create 플래그(--cgroup-parent, --privileged, 볼륨 3개 마운트 경로, dind/podman 명령·env)와 runner 컨테이너의 `DOCKER_HOST`/`CONTAINER_HOST` (§9.1, DESIGN §4.2 표).
 - (runtime/jittar) `.jitconfig` 1개짜리 tar 스트림 생성(경로·mode 0600·uid/gid 1001)과 `cp -` 대상 경로 `/home/runner`, 모드별 래퍼 문자열이 SPEC §7.2-4와 일치 (§7.2-4).
 - (systemd) set-property/stop/revert argv, `Check`의 sudo 분기 (§9.3, §10.2).
+- (github) `CheckAuth`가 그룹 조회로 인증을 확인하고(`Default` 정규화 포함) 실패를 그대로 올린다 (§7.1-2, R7).
 - (github) `GetRunner`의 `(nil, nil)` → found=false, `RemoveRunner`의 `RunnerNotFoundError` → nil, `IsBusy` 판정, `Default` 대소문자 무시 (§8.3, R7).
 - (machine) podman 경로 고정 규칙(§10.2 규칙 3)의 none/sidecar 분기, `id -u` 분기, R16 판정.
 - (machine) R21 재접속 후 위반 → Failed(재접속 중단).
 - (machine) 재접속 백오프 수열(1s→2s→…→30s cap, jitter 범위, 성공 시 리셋) (§7.1-8).
+- (controller/core) 시작 순서: 인증 확인(§7.1-2)이 preflight·pre-pull보다 앞. 인증 실패면 pull·scale set 확보 없이 시작 실패.
 - (controller/core) `msgDesired` → desired 계산 → spread → `startUnit`(create→cp→start) → `Starting`, `SetMaxRunners` 반영 (§7.2-1·3·4).
 - (controller/core) tick의 등록 대조: Starting 승격·grace 초과 Dying, Running 미등록 즉시 Dying (§8.3).
 - (controller/core) 정리 순서: GetRunner → RemoveRunner → 컨테이너 → sidecar → 볼륨 → slice, 각 단계 멱등 (§8.3).

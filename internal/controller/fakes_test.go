@@ -55,6 +55,7 @@ type fakeGH struct {
 	mu        sync.Mutex
 	nextID    int64
 	runners   map[string]int64 // 등록된 runner 이름 → id (GetRunner found)
+	authErr   error
 	jitErr    error
 	getErr    error
 	removeErr error
@@ -67,6 +68,12 @@ func (f *fakeGH) register(name string, id int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.runners[name] = id
+}
+
+// CheckAuth 는 §7.1-2 다. authErr 로 실패를 흉내 낸다.
+func (f *fakeGH) CheckAuth(_ context.Context, group string) error {
+	f.add("CheckAuth %s", group)
+	return f.authErr
 }
 
 func (f *fakeGH) EnsureScaleSet(_ context.Context, name, group string) (int, error) {

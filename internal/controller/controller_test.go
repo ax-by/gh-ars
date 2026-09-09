@@ -566,10 +566,14 @@ func TestRun_S7_1_WalkingSkeleton(t *testing.T) {
 	if !h.gh.session.isClosed() {
 		t.Fatal("세션이 닫히지 않았다") // [§7.3]
 	}
-	// 시작 순서: pre-pull(§7.1-4) → scale set 확보(§7.1-5) → events 열기(§7.1-8) → 동기화(§7.1-7) → 세션(§7.1-9) → JIT·create→cp→start(루프).
-	// events 를 연 뒤 Observe 하는 것은 그 사이의 die 를 놓치지 않기 위한 순서이고, 세션은 동기화 뒤에 연다.
+	// 시작 순서: 인증 확인(§7.1-2) → pre-pull(§7.1-4) → scale set 확보(§7.1-5) → events 열기(§7.1-8) →
+	// 동기화(§7.1-7) → 세션(§7.1-9) → JIT·create→cp→start(루프). 인증 확인이 preflight 앞인 것은
+	// 잘못된 토큰이 pre-pull 을 다 기다린 뒤가 아니라 즉시 드러나게 하기 위함이다.
+	// 여기서 보는 것은 Controller 쪽 순서(에이전트 진입 → 동기화 → 세션)까지다. 에이전트 안의
+	// "events 를 먼저 열고 Observe" 순서는 실물 Agent 로 machine 패키지가 검증한다
+	// (TestRun_S7_1_7_ResyncAfterEventsOpen). fakeAgent 는 스트림을 열지 않는다.
 	all := h.all.snapshot()
-	wantPrefix := []string{"Pull " + testImage, "EnsureScaleSet ss Default", "Run m1", "Observe m1", "NewSession 7 gh-ars", "GenerateJIT 7 ss-m1-", "Create ", "CopyIn ", "Start "}
+	wantPrefix := []string{"CheckAuth Default", "Pull " + testImage, "EnsureScaleSet ss Default", "Run m1", "Observe m1", "NewSession 7 gh-ars", "GenerateJIT 7 ss-m1-", "Create ", "CopyIn ", "Start "}
 	if len(all) < len(wantPrefix) {
 		t.Fatalf("호출 이력 %q", all)
 	}
@@ -582,6 +586,26 @@ func TestRun_S7_1_WalkingSkeleton(t *testing.T) {
 	for _, c := range all {
 		if strings.HasPrefix(c, "Remove ") {
 			t.Fatalf("종료 시 컨테이너를 지웠다: %q", all)
+		}
+	}
+}
+
+// TestRun_S7_1_2_AuthCheckedBeforePreflight: 인증이 실패하면 preflight·pre-pull 을 시작하지도 않고
+// 즉시 시작 실패한다. 이 확인이 없으면 잘못된 토큰이 §7.1-5 에서야 드러나 그때까지 머신 수 ×
+// 이미지당 최대 5분을 버린다. [§7.1-2, §7.1-3, §7.1-4]
+func TestRun_S7_1_2_AuthCheckedBeforePreflight(t *testing.T) {
+	h := newHarness(t, 0)
+	h.gh.authErr = errors.New("401 Unauthorized")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := h.c.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("Run err = %v, want 인증 오류로 시작 실패", err)
+	}
+	for _, c := range h.all.snapshot() {
+		if strings.HasPrefix(c, "Pull ") || strings.HasPrefix(c, "EnsureScaleSet ") {
+			t.Fatalf("인증 실패인데 이후 단계를 진행했다: %q", h.all.snapshot())
 		}
 	}
 }
@@ -640,7 +664,9 @@ func TestStartUnit_S7_3_ShutdownNoRollback(t *testing.T) {
 	h.desired(1)
 	u := h.onlyUnit()
 	ctr := domain.ContainerName(u.ID, domain.RoleRunner)
-	m := h.pumpUntil(isUnitStarted).(msgUnitStarted)
+	// handle 하지 않고 받기만 한다: handleUnitStarted 는 비동기 정리를 띄우고 그 goroutine 의 호출이
+	// 아래 이력에 섞여 들어와 판정이 흔들린다(fake 는 취소된 ctx 에서도 실행된다).
+	m := h.recv().(msgUnitStarted)
 	if m.Err == nil {
 		t.Fatal("중단이 성공으로 보고됐다")
 	}

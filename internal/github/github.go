@@ -32,6 +32,9 @@ const workFolder = "/home/runner/_work"
 
 // Client 는 controller 와 cmd 가 쓰는 GitHub 작업 집합이다. [DESIGN §4.4]
 type Client interface {
+	// CheckAuth: 시작 시 인증·scope 확인(§7.1-2). runnerGroup 을 조회해 토큰 교환과 접근 권한을
+	// 한 번에 확인한다. preflight·pre-pull 보다 먼저 불러 잘못된 토큰이 즉시 드러나게 한다.
+	CheckAuth(ctx context.Context, runnerGroup string) error
 	// EnsureScaleSet: GetRunnerGroupByName → GetRunnerScaleSet(groupID, name) → 없으면
 	// CreateRunnerScaleSet. 그룹 이동은 없다. [§7.1-5]
 	EnsureScaleSet(ctx context.Context, name, runnerGroup string) (id int, err error)
@@ -73,8 +76,8 @@ type client struct {
 	log *slog.Logger
 }
 
-// New 는 인증 방식(PAT / App)에 맞는 scaleset 클라이언트를 만든다. 네트워크 호출은 하지 않는다;
-// 인증·scope 확인(§7.1-2)은 첫 호출(EnsureScaleSet 의 그룹 조회)에서 드러난다. [DESIGN §4.4]
+// New 는 인증 방식(PAT / App)에 맞는 scaleset 클라이언트를 만든다. 네트워크 호출은 하지 않으므로
+// (라이브러리가 URL 파싱과 HTTP 클라이언트 구성만 한다) 토큰 유효성은 CheckAuth 가 확인한다. [§7.1-2, DESIGN §4.4]
 func New(cfg config.GitHub, log *slog.Logger) (Client, error) {
 	info := scaleset.SystemInfo{System: "gh-ars", Subsystem: "controller"}
 	var (
@@ -138,6 +141,19 @@ func (c *client) lookup(ctx context.Context, name, runnerGroup string) (int, *sc
 		return g.ID, nil, fmt.Errorf("scale set %q in group %q: %w", name, runnerGroup, err)
 	}
 	return g.ID, s, nil
+}
+
+// CheckAuth 는 §7.1-2 다. 그룹 조회 한 번으로 토큰 교환(인증)과 그 scope 의 접근 권한을 확인한다.
+// 이것이 없으면 잘못된 토큰이 §7.1-5 의 첫 호출에서야 드러나, 그때까지 preflight 와 pre-pull
+// (이미지당 최대 5분, §8.3)을 모두 마친 뒤에 시작 실패한다.
+//
+// 라이브러리는 그룹을 못 찾으면 오류를 돌려주므로(v0.4.0 client.go: count 0 → error) 잘못된
+// runnerGroup 도 여기서 걸린다. §7.1-5 가 낼 오류를 앞당겨 내는 것이라 판정이 갈리지 않는다.
+func (c *client) CheckAuth(ctx context.Context, runnerGroup string) error {
+	if _, err := c.api.GetRunnerGroupByName(ctx, normalizeGroup(runnerGroup)); err != nil {
+		return fmt.Errorf("github 인증·scope 확인(runner group %q): %w", runnerGroup, err)
+	}
+	return nil
 }
 
 // EnsureScaleSet implements Client. [§7.1-5]

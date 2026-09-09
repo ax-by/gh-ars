@@ -94,6 +94,33 @@ func libErr(status string, wrapped error) error {
 
 // --- GetRunner [§8.3] ---
 
+// TestCheckAuth_S7_1_2: 시작 시 인증·scope 확인은 runner group 조회 한 번이다. R7 의 `Default` 는
+// 클라이언트 상수로 정규화되고 그 밖의 이름은 그대로 나가며, 실패는 그대로 올라가 시작 실패가 된다
+// (라이브러리는 그룹 미존재도 오류로 돌려준다: v0.4.0 client.go count 0 → error). [§7.1-2, R7]
+func TestCheckAuth_S7_1_2(t *testing.T) {
+	f := &fakeAPI{group: &scaleset.RunnerGroup{ID: 1}}
+	if err := newClient(f, nil).CheckAuth(context.Background(), "Default"); err != nil {
+		t.Fatalf("CheckAuth: %v", err)
+	}
+	if f.groupArg != scaleset.DefaultRunnerGroup {
+		t.Fatalf("groupArg %q, want %q", f.groupArg, scaleset.DefaultRunnerGroup)
+	}
+
+	bad := &fakeAPI{groupErr: errors.New("401 Unauthorized")}
+	err := newClient(bad, nil).CheckAuth(context.Background(), "Default")
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("err = %v, want 401 전달", err)
+	}
+
+	custom := &fakeAPI{group: &scaleset.RunnerGroup{ID: 2}}
+	if err := newClient(custom, nil).CheckAuth(context.Background(), "custom"); err != nil {
+		t.Fatalf("CheckAuth(custom): %v", err)
+	}
+	if custom.groupArg != "custom" { // Default 가 아닌 이름은 그대로 나간다
+		t.Fatalf("groupArg %q, want %q", custom.groupArg, "custom")
+	}
+}
+
 func TestGetRunner_S8_3_NilNilIsNotFound(t *testing.T) {
 	f := &fakeAPI{}
 	ref, found, err := newTestClient(f).GetRunner(context.Background(), "ss-m-u")
