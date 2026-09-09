@@ -183,8 +183,11 @@ func (c *Controller) handleEvent(m msgEvent) {
 	u.Parts.Runner = true // exited 컨테이너가 남아 있다
 	c.markDying(u)
 	// minRunners 미달분만 보충한다. assigned 기반 생성은 다음 msgDesired 에서. [§7.2-5]
+	// 보충 목표도 capacity 로 자른다: R24 가 경고만 하고 지나가는 경우(미도달 머신이 있는 시작)
+	// minRunners > capacity 로 돌 수 있는데, 그때 미달분을 그대로 만들면 maxRunners 를 넘는다. [§7.2-3]
 	if ss != nil {
-		if short := ss.MinRunners - plan.Running(c.unitList(), ss.Name); short > 0 {
+		warm := plan.Desired(plan.Capacity(ss.ScaleSet, c.machines), ss.MinRunners, 0)
+		if short := warm - plan.Running(c.unitList(), ss.Name); short > 0 {
 			c.createUnits(ss, short)
 		}
 	}

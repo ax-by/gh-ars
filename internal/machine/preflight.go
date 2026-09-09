@@ -48,10 +48,6 @@ func (a *Agent) connect(ctx context.Context) (*conn, runtime.Info, error) {
 			_ = ex.Close()
 		}
 	}()
-	// 2~5단계는 전부 즉시 끝나야 하는 확인 명령이다. 하나가 매달리면 이 머신의 첫 동기화가
-	// 막히고 세션 시작까지 밀리므로 상한을 건다(pre-pull 은 호출자가 상한 없이 한다).
-	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
-	defer cancel()
 
 	root, err := isRoot(ctx, ex) // 2. [§10.2 규칙 1]
 	if err != nil {
@@ -89,6 +85,8 @@ func (a *Agent) newExecutor() (executor.Executor, error) {
 
 // isRoot 는 `id -u` 로 root 여부를 본다. 명령 자체가 실패하면 도달 불가로 본다. [§10.2 규칙 1]
 func isRoot(ctx context.Context, ex executor.Executor) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout) // 확인 명령 1회당 상한 [§8.3]
+	defer cancel()
 	res, err := ex.Run(ctx, executor.Cmd{Argv: []string{"id", "-u"}})
 	if err != nil {
 		return false, fmt.Errorf("preflight: id -u: %w", err)
@@ -99,6 +97,14 @@ func isRoot(ctx context.Context, ex executor.Executor) (bool, error) {
 	return strings.TrimSpace(string(res.Stdout)) == "0", nil
 }
 
+// probeInfo 는 `info` 한 번이다. 상한은 명령 1회당 건다(fallback 으로 여러 번 부를 수 있고,
+// 한 번의 매달림이 다른 확인 명령의 몫을 먹으면 안 된다). [§8.3 "preflight·관측 probe 상한"]
+func probeInfo(ctx context.Context, rt runtime.Runtime) (runtime.Info, error) {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	return rt.Info(ctx)
+}
+
 // fixRuntimePath 는 §10.2 규칙 2·3 이다. podman 은 성공한 경로(sudo 없음 / `sudo -n`)를 고정해
 // 이후 **모든** 명령에 같은 경로를 쓴다. 반환한 Runtime 이 그 고정 결과다.
 func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runtime.Runtime, bool, runtime.Info, error) {
@@ -106,7 +112,7 @@ func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runti
 	case domain.RuntimeDocker:
 		// 규칙 2: docker 는 sudo 를 쓰지 않는다(docker 그룹 멤버 또는 root).
 		rt := runtime.NewDocker(ex, false)
-		info, err := rt.Info(ctx)
+		info, err := probeInfo(ctx, rt)
 		if err != nil {
 			return nil, false, runtime.Info{}, a.infoFailure("docker info", err)
 		}
@@ -118,7 +124,7 @@ func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runti
 		if a.podmanSudo != nil {
 			sudo := *a.podmanSudo
 			rt := runtime.NewPodman(ex, sudo)
-			info, err := rt.Info(ctx)
+			info, err := probeInfo(ctx, rt)
 			if err != nil {
 				return nil, false, runtime.Info{}, a.infoFailure("podman info", err)
 			}
@@ -130,11 +136,11 @@ func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runti
 		// 규칙 3: `podman info` → 실패하면 `sudo -n podman info`. 성공한 쪽을 고정한다.
 		sudo := false
 		rt := runtime.NewPodman(ex, false)
-		info, err := rt.Info(ctx)
+		info, err := probeInfo(ctx, rt)
 		if err != nil {
 			sudo = true
 			rt = runtime.NewPodman(ex, true)
-			info2, err2 := rt.Info(ctx)
+			info2, err2 := probeInfo(ctx, rt)
 			if err2 != nil {
 				return nil, false, runtime.Info{}, a.infoFailure("podman info", errors.Join(err, err2))
 			}
@@ -145,7 +151,7 @@ func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runti
 		if a.spec.Mode == domain.ModeSidecar && info.Rootless {
 			if !sudo {
 				sudoRT := runtime.NewPodman(ex, true)
-				if sudoInfo, err := sudoRT.Info(ctx); err == nil && !sudoInfo.Rootless {
+				if sudoInfo, err := probeInfo(ctx, sudoRT); err == nil && !sudoInfo.Rootless {
 					a.log.Info("podman path fixed", "sudo", true, "rootless", false)
 					a.podmanSudo = ptr(true)
 					return sudoRT, true, sudoInfo, nil
@@ -179,7 +185,9 @@ func (a *Agent) checkSidecar(ctx context.Context, ex executor.Executor, info run
 		return fmt.Errorf("%w: sidecar 모드 머신 %q (Phase 12)", ErrUnsupported, a.name)
 	}
 	// 규칙 4: systemctl 은 root 가 아니면 항상 `sudo -n`.
-	if err := a.spec.NewSlices(ex, !root).Check(ctx); err != nil {
+	cctx, ccancel := context.WithTimeout(ctx, probeTimeout) // 확인 명령 1회당 상한 [§8.3]
+	defer ccancel()
+	if err := a.spec.NewSlices(ex, !root).Check(cctx); err != nil {
 		return fatalf("R16 머신 %q: systemctl 확인 실패: %s", a.name, err)
 	}
 	return nil

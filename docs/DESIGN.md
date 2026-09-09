@@ -185,7 +185,7 @@ func NewSSH(cfg SSHConfig) (Executor, error)   // 연결 유지, host key 검증
 
 **비0 종료는 오류가 아니라 값이다.** 종료 코드로 분기하는 호출자가 있기 때문이다: preflight 의 podman 경로 고정(§10.2 규칙 3)은 `podman info` 실패를 보고 `sudo -n podman info` 로 넘어가고, 정리 단계(§8.3)는 "이미 없음"을 성공으로 취급한다. 오류를 받아야 하는 실패(바이너리 없음, 접속 끊김, 취소)와 명령의 정상적인 부정 응답을 호출자가 매번 풀어보지 않고 구분하게 한다.
 
-**파이프 대기에는 상한이 있다.** 파이프는 자식의 fd 를 물려받은 손자가 살아 있는 동안 열려 있어, 자식이 죽어도 EOF 가 오지 않을 수 있다(`sudo -n podman info` 가 이 모양이다). 상한이 없으면 `Run` 과 스트림의 `Read`·`Close` 가 손자의 수명만큼 매달려, 기동 타임아웃 2분(§7.2-4)이 지나도 `startUnit` goroutine 이 풀리지 않고 events 재시작(§7.1-8)도 영영 일어나지 않는다. 그래서 자식이 끝난 뒤 파이프가 닫히기를 기다리는 시간을 상한(코드 상수)으로 막는다.
+**파이프 대기에는 상한이 있다.** 파이프는 자식의 fd 를 물려받은 손자가 살아 있는 동안 열려 있어, 자식이 죽어도 EOF 가 오지 않을 수 있다(`sudo -n podman info` 가 이 모양이다). 상한이 없으면 `Run` 과 스트림의 `Read`·`Close` 가 손자의 수명만큼 매달려, 기동 타임아웃 2분(§7.2-4)이 지나도 `startUnit` goroutine 이 풀리지 않고 events 재시작(§7.1-8)도 영영 일어나지 않는다. 그래서 자식이 끝난 뒤 파이프가 닫히기를 기다리는 시간을 상한(코드 상수 `pipeDrainDelay`)으로 막는다. 이것은 관측 가능한 계약을 바꾸지 않는 내부 방어 상수라 SPEC §8.3 표가 아니라 여기에 둔다(§8.3 머리말 기준).
 
 이 상한이 스트림에서도 실제로 걸리려면 `Wait` 이 `Read` 와 나란히 돌아야 한다. `StdoutPipe` 는 파이프를 닫는 주체가 `Wait` 이라 "다 읽은 뒤 `Wait`" 순서를 요구하는데, 손자가 stdout 을 물고 있으면 `Read` 가 끝나지 않아 `Wait` 이 시작되지도 못하고 상한이 발동할 기회가 없다. 그래서 스트림은 `io.Pipe` 를 `cmd.Stdout` 으로 주고 `Wait` 을 곧바로 돌린 뒤, 그 결과를 파이프에 실어 `Read` 의 종료 통지로 만든다.
 
@@ -355,7 +355,7 @@ func (s *scaleSetScaler) HandleJobCompleted(ctx, *scaleset.JobCompleted) error /
 - RunnerID 대조: `JobCompleted`의 이름이 비면 살아 있는 unit의 id(`runnerIDs`, GenerateJIT 결과 또는 입양 unit의 첫 `GetRunner` 결과에서 `learnRunnerID`로 기록) → `pendingCompletion` 항목의 RunnerID 순으로 찾는다. 둘 다 없으면 `completedIDs`(RunnerID → 수신 시각)에 보관하고, `learnRunnerID`가 그 id를 알게 되는 시점에 적용한다(살아 있으면 `Completed=true`, 아니면 `pendingCompletion`에서 제거). `msgTick`이 5분 지난 항목을 버린다. [§7.2-3]
 - `SetMaxRunners(n)`은 atomic 저장이며 다음 `GetMessage`의 `maxCapacity`에 반영된다. [§7.2-1]
 - `listener.Config.Validate`는 `0 ≤ MaxRunners ≤ MaxInt32`를 요구한다. **MaxRunners 0이 허용**되므로 capacity 0인 scale set도 listener를 정상 시작하고, 운영 중 `SetMaxRunners(0)`도 허용된다. 중지·재시작 로직은 필요 없다.
-- 초기 세션의 `Statistics`가 nil이면 `Run`이 오류를 반환한다. Controller는 listener 오류를 로그 후 이전 세션을 닫고 백오프(§7 백오프와 동일 수열)로 재시작한다. "성공 시 리셋"의 성공은 세션이 백오프 최대값(30s) 이상 유지된 것으로 본다(`Run`은 오류로만 끝나므로 다른 성공 신호가 없다). 세션 (재)시작마다 `msgSessionStarted`를 보내 `pendingCompletion`을 비운다(§7.2-3 안전장치 1).
+- 초기 세션의 `Statistics`가 nil이면 `Run`이 오류를 반환한다. Controller는 listener 오류를 로그 후 이전 세션을 닫고 백오프(§7 백오프와 동일 수열)로 재시작한다. "성공 시 리셋"의 성공은 세션이 백오프 최대값(30s) 이상 유지된 것으로 본다(`Run`은 오류로만 끝나므로 다른 성공 신호가 없다). 유지 시간은 세션이 선 뒤부터 재고 세션 생성·정리 시간은 빼며(생성이 느리게 실패한 회차를 성공으로 세지 않는다), 이는 §7 회차의 스트림 유지 시간과 같은 기준이다. 세션 (재)시작마다 `msgSessionStarted`를 보내 `pendingCompletion`을 비운다(§7.2-3 안전장치 1).
 - 세션은 `SetMaxRunners` 반영을 위해 `scaleSetState`가 원자 값(`capacity`, listener 핸들)으로 들고, listener goroutine은 생성 직후 저장된 capacity를 한 번 더 `SetMaxRunners`해 생성과 저장 사이의 변경을 흡수한다.
 
 ## 5. 순수 로직 (`internal/plan`)  [§8]
@@ -468,6 +468,8 @@ preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 4. sidecar scale set이면: `CgroupDriver == systemd && CgroupVersion == 2` 확인, `Slices.Check()`(root 아니면 sudo -n) → 실패 시 R16 오류.
 5. resources: 생략 시 `info`의 CPUs/MemoryBytes, 명시 시 탐지값으로 cap(R21 경고). physicalMax·effectiveMax 계산(R21 오류, R22 경고).
 6. pre-pull: runner 이미지, sidecar면 sidecar 이미지. 실패 → unhealthy.
+
+2~5단계의 확인 명령과 관측(`ps`, `volume ls`), events 스트림 **열기**에는 probe 상한(§8.3 상수 표)을 건다. 열기에만 거는 이유는 스트림 자체가 장기 실행이기 때문이고, 상한은 열기 구간에만 타이머로 스트림 ctx를 취소해 건다. 6단계 pull은 이미지 크기에 비례하므로 별도의 pre-pull 상한(§8.3)을 쓴다.
 
 시작 시와 재접속 시의 차이: 시작 시 R16/R21 오류는 프로세스 시작 실패. 재접속 후 preflight에서 같은 오류가 나면 `msgHealth{Failed}`를 보내고 에이전트 goroutine을 종료한다(재접속 없음). R24는 Controller가 시작 시 한 번 평가한다: 전 머신 도달이면 위반 시 시작 실패, 미도달 머신이 있으면 경고. [§6.2 R21, R24]
 

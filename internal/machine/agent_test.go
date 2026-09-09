@@ -184,11 +184,12 @@ func TestRun_S7_1_7_ResyncAfterEventsOpen(t *testing.T) {
 	}
 }
 
-// TestRun_R21_VerifyEveryRound: preflight 를 건너뛰는 회차(local 의 events 재시작)에도 그 회차의
-// info 로 예산을 다시 판정한다. 위반이면 Resynced 를 보내지 않고 Failed 로 끝난다. [§7.1-3, R21]
-func TestRun_R21_VerifyEveryRound(t *testing.T) {
+// TestRun_R21_VerifyOnPreflightSkippedRound: preflight 를 건너뛰는 회차 — local 머신의 events 재시작이
+// 이 모양이다 — 에도 그 회차의 info 로 예산을 다시 판정한다. NewWithRuntime 에이전트는 접속·preflight
+// 단계가 없어 그 회차를 그대로 재현한다. 위반이면 Resynced 없이 Failed 로 끝난다. [§7.1-3, R21]
+func TestRun_R21_VerifyOnPreflightSkippedRound(t *testing.T) {
 	rt := &fakeRT{}
-	a := NewWithRuntime(Spec{Name: "m1", Verify: func(info runtime.Info) error {
+	a := NewWithRuntime(Spec{Name: "m1", Local: true, Verify: func(info runtime.Info) error {
 		if info.CPUs < 2 {
 			return errors.New("R21 resources (cpu=1) < unit (cpu=2)")
 		}

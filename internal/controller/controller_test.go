@@ -350,6 +350,26 @@ func TestDie_S7_2_5_NoNewUnit(t *testing.T) {
 	}
 }
 
+// TestDie_S7_2_5_ReplenishCappedByCapacity: die 뒤 minRunners 보충도 capacity 를 넘지 않는다.
+// R24 는 미도달 머신이 있으면 minRunners > capacity 여도 경고만 하고 시작하므로, 미달분을 그대로
+// 만들면 maxRunners 를 넘게 된다. [§7.2-3, §7.2-5, R24]
+func TestDie_S7_2_5_ReplenishCappedByCapacity(t *testing.T) {
+	h := newHarness(t, 3)                      // minRunners=3
+	h.c.scaleSets[testScaleSet].MaxRunners = 1 // capacity = min(effectiveMax 4, 1) = 1
+	u := h.addUnit(domain.StateRunning)
+	h.die(u.ID, domain.RoleRunner)
+	created := 0
+	for _, x := range h.c.units {
+		if x.State == domain.StateCreating {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("보충 생성 %d개, want 1 (capacity 1)", created)
+	}
+	h.pumpEach(isCleanupDone, isUnitStarted)
+}
+
 // TestDie_S7_2_5_MinRunnersReplenish: minRunners=1 인 scale set 의 unit 이 die 하면 미달분만 즉시 보충한다. [§7.2-5]
 func TestDie_S7_2_5_MinRunnersReplenish(t *testing.T) {
 	h := newHarness(t, 1)

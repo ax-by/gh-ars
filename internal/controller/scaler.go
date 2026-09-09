@@ -66,13 +66,15 @@ func (c *Controller) runListener(ctx context.Context, ss *scaleSetState) {
 	var bo machine.Backoff
 	log := c.log.With("scaleSet", ss.Name)
 	for ctx.Err() == nil {
-		started := time.Now()
-		err := c.serveListener(ctx, ss)
+		life, err := c.serveListener(ctx, ss)
 		if ctx.Err() != nil {
 			return
 		}
-		if time.Since(started) >= machine.BackoffMax {
-			bo.Reset() // 한동안 정상 동작했으면 성공으로 보고 수열을 되돌린다 [§7.1-8 "성공 시 리셋"]
+		// 리셋 자격은 "세션이 실제로 서 있던 시간"이다: 세션 생성이 느리게 실패한 회차(NewSession
+		// 타임아웃 등)까지 성공으로 세면 지수 백오프가 무력화된다. machine 회차의 스트림 유지 시간과
+		// 같은 기준. [§7.1-8 "성공 시 리셋", DESIGN §4.5, DESIGN §7]
+		if life >= machine.BackoffMax {
+			bo.Reset()
 		}
 		log.Warn("listener stopped, restarting", "err", err)
 		if bo.Wait(ctx) != nil {
@@ -81,11 +83,15 @@ func (c *Controller) runListener(ctx context.Context, ss *scaleSetState) {
 	}
 }
 
-func (c *Controller) serveListener(ctx context.Context, ss *scaleSetState) error {
+// serveListener 는 세션 하나의 수명이다. 돌려주는 시간은 **세션이 선 뒤부터** 끝날 때까지로,
+// 백오프 리셋 자격 판정에 쓴다(세션 생성·정리 시간은 빼고 잰다). [DESIGN §4.5]
+func (c *Controller) serveListener(ctx context.Context, ss *scaleSetState) (time.Duration, error) {
 	session, err := c.gh.NewSession(ctx, ss.GitHubID, sessionOwner())
 	if err != nil {
-		return err
+		return 0, err
 	}
+	establishedAt := time.Now()
+	life := func() time.Duration { return time.Since(establishedAt) }
 	defer func() {
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sessionCloseTimeout)
 		defer cancel()
@@ -102,11 +108,12 @@ func (c *Controller) serveListener(ctx context.Context, ss *scaleSetState) error
 		Logger:     c.log.With("scaleSet", ss.Name, "component", "listener"),
 	})
 	if err != nil {
-		return err
+		return life(), err
 	}
 	var ms maxSetter = l
 	ss.lst.Store(&ms)
 	defer ss.lst.Store(nil)
 	l.SetMaxRunners(int(ss.capacity.Load())) // 생성과 Store 사이에 바뀐 capacity 를 반영 [§7.2-1]
-	return l.Run(ctx, &scaleSetScaler{c: c, ss: ss})
+	err = l.Run(ctx, &scaleSetScaler{c: c, ss: ss})
+	return life(), err
 }

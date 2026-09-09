@@ -48,7 +48,8 @@
 - 여러 org/repo 동시 운영 (프로세스 분리로 대체)
 - job별 리소스 조정
 - 가짜 Scale Set 서버, 자동화된 통합 테스트, 메트릭/웹 UI
-- 타임아웃·grace 상수의 설정 노출 (grace 5분, GitHub 큐 대기 24h, SSH 접속 타임아웃 10s, runner 기동 타임아웃 2분은 코드 상수. 노출은 후속 과제)
+- 타임아웃·grace 상수의 설정 노출 (§8.3 상수 표의 값들은 코드 상수. 노출은 후속 과제)
+- pre-pull의 무진행(idle) 감지 (MVP는 §8.3의 pre-pull 상한 하나로 막는다. 정상적으로 느린 pull을 살리면서 응답 없는 pull만 끊으려면 총량이 아니라 "출력이 60s 이상 없으면 중단"이 맞다. 후속 과제)
 
 ## 4. 핵심 개념
 
@@ -247,7 +248,7 @@ machines:
    - `machines[].resources` 생략 시 `info`로 CPU/메모리 자동 탐지, 명시 시 cap(R21). physicalMax·effectiveMax 계산(R22).
    - podman이면 `podman info --format '{{.Host.Security.Rootless}}'`로 rootless 확인. sidecar scale set이면 R16의 systemd/cgroup/권한(§10.2) 확인.
    - 분류: 설정·환경 모순(R16, R21 오류)은 **시작 실패**. 도달 불가·명령 실패는 **unhealthy**로 표시하고 배치에서 제외(프로세스는 계속, 재접속 시 재시도). 재접속 후 preflight에서 R16/R21 위반이 드러나면 시작 실패 대신 그 머신을 **`Failed`**(영구 제외, 재접속 안 함)로 두고 오류 로그.
-4. 이미지 pre-pull: 각 healthy 머신에 `runner.image`를 pull. sidecar scale set이면 `jobRuntime.image`(또는 runtime별 기본 이미지)도 pull. 실패 머신은 unhealthy.
+4. 이미지 pre-pull: 각 healthy 머신에 `runner.image`를 pull. sidecar scale set이면 `jobRuntime.image`(또는 runtime별 기본 이미지)도 pull. 실패 머신은 unhealthy. pull 하나가 상한(§8.3)을 넘기면 실패로 본다 — preflight는 그 머신의 첫 통지(§7.1-7)보다 앞이므로, 상한이 없으면 응답 없는 pull 하나가 모든 scale set의 세션 시작(§7.1-9)을 무한정 막고 재접속 회차도 같은 자리에서 멈춰 그 머신이 unhealthy에 갇힌다.
 5. scale set 확보: `runnerGroup`을 `GetRunnerGroupByName`으로 조회 → 그 그룹 안에서 이름으로 `GetRunnerScaleSet(groupID, name)` → 없으면 `CreateRunnerScaleSet`. 그룹 이동 분기는 없다.[^group] **종료 시 삭제하지 않는다.**
 
 [^group]: 조회가 그룹 단위라 다른 그룹에 있는 동명 scale set은 발견되지 않으므로 "있으면 그룹 이동" 분기는 도달 불가다. 그룹 이동은 non-goal(§3.2). 다른 그룹의 동명 scale set과 이름이 충돌하면 GitHub이 생성을 거부하고 gh-ars는 시작 실패한다.
@@ -346,7 +347,8 @@ capacity가 `X-ScaleSetMaxCapacity`로 보고된다. 적용 방식: none은 컨�
 
 unit id를 알 수 없는 고아 등록(GenerateJIT 직후·컨테이너 create 전에 gh-ars가 죽은 경우)은 MVP에서 정리하지 않는다(§3.2). 근거(GitHub 문서 "Removing self-hosted runners"): "If JIT runners never run a job, they will automatically be removed", "An ephemeral self-hosted runner is automatically removed from GitHub if it has not connected to GitHub Actions for more than 1 day". 고아 등록은 runner 프로세스가 한 번도 접속하지 않은 JIT·ephemeral 등록이므로 늦어도 1일 안에 GitHub이 지운다. 그동안 offline 상태라 job을 받지 않는다.
 
-상수(MVP에서 코드에 고정, 설정 미노출. 노출은 후속 과제 §3.2):
+상수(MVP에서 코드에 고정, 설정 미노출. 노출은 후속 과제 §3.2).
+이 표에는 관측 가능한 동작을 규정하는 상수만 싣는다(상태 전이 트리거, capacity 영향, 타이밍 계약). 관측 가능한 계약을 바꾸지 않는 내부 방어 상수는 DESIGN에 둔다.
 
 | 상수 | 값 | 용도 |
 |---|---|---|
@@ -357,6 +359,8 @@ unit id를 알 수 없는 고아 등록(GenerateJIT 직후·컨테이너 create 
 | SSH 접속 타임아웃 | 10s | 접속·재접속 시도 1회당(§7.1-8, §10.1) |
 | runner 기동 타임아웃 | 2분 | create→cp→start 완료까지(§7.2-4) |
 | 정리 회차 상한 | 2분 | unit 정리(또는 startUnit 되돌리기) 1회 시도의 상한. 초과면 실패로 보고 Dying 유지, 다음 tick(30s)에서 재시도 |
+| preflight·관측 probe 상한 | 30s | preflight의 확인 명령(`id -u`, `info`)과 전체 동기화의 관측(`ps`, `volume ls`), events 스트림 **열기** 1회당(스트림 유지에는 상한이 없다). 초과면 그 회차 실패 → 머신 unhealthy → 백오프 재시도(§7.1-3, §7.1-7, §7.1-8) |
+| pre-pull 상한 | 5분 | 이미지 pull 1개당(§7.1-4). 초과면 pull 실패 → 그 머신 unhealthy. 이 값이 곧 응답 없는 pull이 세션 시작을 막을 수 있는 최악의 시간이다 |
 
 ## 9. sidecar 모드 상세
 

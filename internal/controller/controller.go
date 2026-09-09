@@ -32,8 +32,8 @@ const (
 	tickInterval  = 30 * time.Second // 상태 대조 tick [§8.3]
 	pendingExpiry = 5 * time.Minute  // pendingCompletion 항목 유지 상한 [§7.2-3]
 	startTimeout  = 2 * time.Minute  // create→cp→start 완료까지 [§7.2-4]
-	// cleanupTimeout 은 정리 한 회차의 상한이다. SPEC 은 정하지 않지만 상한이 없으면 명령이 매달릴 때
-	// 그 unit 의 정리가 영영 "진행 중" 으로 남아 tick 재시도(§8.3)가 일어나지 않는다. 기동 타임아웃과 같은 값.
+	// cleanupTimeout 은 정리(또는 startUnit 되돌리기) 1회 시도의 상한이다. 초과면 실패로 보고
+	// Dying 을 유지하고 다음 tick 에서 재시도한다. 기동 타임아웃과 같은 값. [§8.3 "정리 회차 상한"]
 	cleanupTimeout = startTimeout
 )
 

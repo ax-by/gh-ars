@@ -116,4 +116,5 @@ Phase 7 코드 범위: local executor + docker + none 모드. SSH 머신·podman
 
 구현 시 기본값으로 정하기로 한 항목(URL 판별 규칙, `${file:}` 공백 제거, 다이제스트 참조 허용, `RunnerSetting{Ephemeral, DisableUpdate}`, 세션 owner 문자열)은 코드 주석에 근거를 남긴다. 완료한 결정은 이 목록에서 지운다(근거는 `docs/DECISIONS.md`).
 
+- 입양 unit 의 늦은 등록 대조 결과(`msgRegistration`)가 정리 완료 뒤에 오면 그 runner id 를 버린다(`handleRegistration` 의 `u == nil` 조기 반환). busy 로 죽은 입양 unit 의 `pendingCompletion` 항목이 이름 없는 `JobCompleted` 와 대조되지 못해 최대 5분(만료)까지 남고, 그동안 1개 과소 배치가 된다. Phase 11 의 `pendingCompletion` 보정 항목에서 함께 처리한다(§7.2-3, DESIGN §4.5. Phase 10 리뷰 지적).
 - 늦은 `JobStarted`(die가 먼저 와 이미 정리된 unit)는 DESIGN §6 대로 로그만 남긴다. Phase 7 리뷰어 가설: 아주 짧은 job에서 캐시 통계로 불필요한 unit 1개가 뜰 수 있다. Phase 11 축소에서 회수되는지 확인한 뒤 닫는다.

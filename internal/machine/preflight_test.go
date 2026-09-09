@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"gh-ars/internal/domain"
 	"gh-ars/internal/executor"
@@ -24,6 +25,35 @@ type fakeExec struct {
 	h func(sudo bool, argv []string) (executor.Result, error)
 	// stream 은 Stream 이 돌려줄 내용이다. 비어 있으면 즉시 EOF(스트림 종료).
 	stream string
+	// budget 은 명령마다 남아 있던 ctx 여유다(상한이 없으면 항목이 없다). [§8.3 상수 표]
+	budget map[string]time.Duration
+}
+
+func (f *fakeExec) note(key string, ctx context.Context) {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.budget == nil {
+		f.budget = map[string]time.Duration{}
+	}
+	if _, seen := f.budget[key]; !seen {
+		f.budget[key] = time.Until(dl)
+	}
+}
+
+// budgetFor 는 argv 가 prefix 로 시작한 첫 명령의 ctx 여유다.
+func (f *fakeExec) budgetFor(prefix string) (time.Duration, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k, v := range f.budget {
+		if strings.HasPrefix(k, prefix) {
+			return v, true
+		}
+	}
+	return 0, false
 }
 
 func cmdKey(c executor.Cmd) string {
@@ -34,7 +64,8 @@ func cmdKey(c executor.Cmd) string {
 	return s
 }
 
-func (f *fakeExec) Run(_ context.Context, c executor.Cmd) (executor.Result, error) {
+func (f *fakeExec) Run(ctx context.Context, c executor.Cmd) (executor.Result, error) {
+	f.note(cmdKey(c), ctx)
 	f.mu.Lock()
 	f.log = append(f.log, cmdKey(c))
 	f.mu.Unlock()
@@ -501,6 +532,45 @@ func TestPreflight_S10_2_PodmanPathStickyAcrossReconnects(t *testing.T) {
 	for _, c := range ex.calls() {
 		if strings.HasPrefix(c, "sudo -n podman info") {
 			t.Fatalf("재접속에서 다른 경로로 갈아탔다: %v", ex.calls())
+		}
+	}
+}
+
+// TestPreflight_S8_3_CommandTimeouts: 확인 명령(`id -u`, `info`)과 관측(`ps`, `volume ls`)에는 probe
+// 상한(30s), pre-pull 에는 pre-pull 상한(5분)이 걸린다. preflight 는 그 머신의 첫 통지보다 앞이라
+// 상한이 없으면 응답 없는 명령 하나가 모든 scale set 의 세션 시작을 막는다. [§7.1-4, §8.3 상수 표]
+func TestPreflight_S8_3_CommandTimeouts(t *testing.T) {
+	ex := &fakeExec{h: uid("0", func(_ bool, argv []string) (executor.Result, error) {
+		if isCmd(argv, "docker", "info") {
+			return ok(dockerInfoJSON("systemd", "2"))
+		}
+		return executor.Result{}, nil
+	})}
+	a := newAgent(t, Spec{Name: "m1", Local: true, Runtime: domain.RuntimeDocker, Mode: domain.ModeNone,
+		Images: []string{"img"}}, ex)
+	if _, err := a.Preflight(context.Background()); err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if _, err := a.Observe(context.Background()); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	for _, tc := range []struct {
+		prefix string
+		want   time.Duration
+	}{
+		{"id -u", probeTimeout},
+		{"docker info", probeTimeout},
+		{"docker pull ", pullTimeout},
+		{"docker ps ", probeTimeout},
+		{"docker volume ls", probeTimeout},
+	} {
+		got, found := ex.budgetFor(tc.prefix)
+		if !found {
+			t.Fatalf("%q 에 상한이 없다", tc.prefix)
+		}
+		// 명령 실행까지의 경과분만큼 줄어드니 want 이하 · want-5s 초과여야 한다.
+		if got > tc.want || got < tc.want-5*time.Second {
+			t.Fatalf("%q 상한 %v, want ≈%v", tc.prefix, got, tc.want)
 		}
 	}
 }

@@ -95,11 +95,16 @@ type Sink interface {
 // ErrUnsupported 는 아직 구현되지 않은 조합이다(sidecar 는 Phase 12).
 var ErrUnsupported = errors.New("machine: 아직 지원하지 않는 구성")
 
-// probeTimeout 은 즉시 끝나야 하는 확인 명령(`id -u`, `info`, `ps`, `volume ls`) 한 묶음의 상한이다.
-// SPEC 은 이 값을 정하지 않지만 상한이 없으면 매달린 명령 하나가 그 머신의 첫 동기화를 막고,
-// Controller 는 머신마다 첫 통지를 기다리므로(§7.1-7 → §7.1-9) 모든 scale set 의 세션 시작이 영영
-// 오지 않는다. pre-pull(이미지 크기에 비례)과 events(장기 스트림)에는 걸지 않는다. tick 간격과 같은 값. [§8.3 상수 표]
-const probeTimeout = 30 * time.Second
+// 코드 상수. SPEC §8.3 상수 표를 따른다.
+const (
+	// probeTimeout 은 즉시 끝나야 하는 확인 명령(`id -u`, `info`, `ps`, `volume ls`)과 events
+	// 스트림 **열기** 의 상한이다. 스트림 유지에는 걸지 않는다. [§8.3 "preflight·관측 probe 상한"]
+	probeTimeout = 30 * time.Second
+	// pullTimeout 은 이미지 pull 1개의 상한이다. 이미지 크기에 비례하므로 probe 보다 길지만,
+	// preflight 는 첫 통지보다 앞이라 이 값이 곧 응답 없는 pull 이 세션 시작을 막는 최악의 시간이다.
+	// [§7.1-4, §8.3 "pre-pull 상한"]
+	pullTimeout = 5 * time.Minute
+)
 
 // Agent 는 머신 하나의 통로다. Runtime 은 Controller 가 unit 생성·정리 명령에 직접 쓴다. [DESIGN §7]
 type Agent struct {
@@ -173,8 +178,11 @@ func (a *Agent) Preflight(ctx context.Context) (runtime.Info, error) {
 	if err != nil {
 		return runtime.Info{}, err
 	}
-	for _, img := range a.spec.Images { // 6. pre-pull. 실패 → unhealthy [§7.1-4]
-		if err := c.rt.Pull(ctx, img); err != nil {
+	for _, img := range a.spec.Images { // 6. pre-pull. 실패(상한 초과 포함) → unhealthy [§7.1-4]
+		pctx, pcancel := context.WithTimeout(ctx, pullTimeout)
+		err := c.rt.Pull(pctx, img)
+		pcancel()
+		if err != nil {
 			_ = c.ex.Close()
 			return runtime.Info{}, fmt.Errorf("pre-pull %s: %w", img, err)
 		}
@@ -221,14 +229,17 @@ func (a *Agent) Observe(ctx context.Context) (Snapshot, error) {
 	if rt == nil {
 		return Snapshot{}, errors.New("observe: 접속 없음")
 	}
-	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
-	defer cancel()
+	// 상한은 관측 명령 1회당 건다. [§8.3 "preflight·관측 probe 상한"]
 	at := time.Now()
-	ctrs, err := rt.List(ctx, domain.UnitLabelFilter)
+	lctx, lcancel := context.WithTimeout(ctx, probeTimeout)
+	ctrs, err := rt.List(lctx, domain.UnitLabelFilter)
+	lcancel()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("observe: %w", err)
 	}
-	vols, err := rt.VolumeList(ctx, domain.UnitLabelFilter)
+	vctx, vcancel := context.WithTimeout(ctx, probeTimeout)
+	vols, err := rt.VolumeList(vctx, domain.UnitLabelFilter)
+	vcancel()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("observe: %w", err)
 	}
