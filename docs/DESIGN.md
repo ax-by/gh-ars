@@ -457,7 +457,7 @@ JIT 생성(GitHub) → [sidecar: slice Create, 볼륨 3개 Create, sidecar 컨�
 
 머신마다 goroutine 하나. 책임: 접속 유지, preflight, pre-pull, `Events` 스트림 수신 → `msgEvent`, 단절 시 백오프 재접속 → 재접속 후 `Observe()`(ps -a, 볼륨, slice) → `msgResynced`. Controller는 `Agent.Runtime()`, `Agent.Slices()`로 명령을 보낸다.
 
-`Run(ctx, sink)`의 회차: `Events` 열기 → `info`(데몬 생존) → `Observe`(관측 시각 기록) → `Resynced` → 스트림 소비. **events를 먼저 열고 관측한다**(반대면 그 사이의 die를 놓친다). 열기 직후 스트림이 이미 끝나 있으면 `Resynced`를 보내지 않고 실패로 본다(백오프 리셋 없음). 스트림이 끝나면 `Unhealthy` → 백오프 → 다음 회차. 첫 회차는 `Resynced` 또는 `Unhealthy` 중 하나를 반드시 보내며, Controller는 시작 시 머신마다 그 첫 통지를 기다린 뒤 메시지 세션을 연다(§7.1-7·8 → §7.1-9 순서. 첫 desired로 만든 unit의 die를 events가 받아야 한다). 시작 시 §7.1-7 동기화도 이 첫 회차의 `Resynced`다.
+`Run(ctx, sink)`의 회차: `Events` 열기 → `info`(데몬 생존) → `Observe`(관측 시각 기록) → `Resynced` → 스트림 소비. **events를 먼저 열고 관측한다**(반대면 그 사이의 die를 놓친다). 열기 직후 스트림이 이미 끝나 있으면 `Resynced`를 보내지 않고 실패로 본다. `Resynced`를 보낸 회차라도 백오프 리셋은 스트림이 백오프 최대값(30s) 이상 유지된 경우에만 한다(§6 listener 세션과 동일 기준). 유지 시간은 회차 전체가 아니라 events 스트림이 열려 있던 시간으로 잰다(pre-pull이 오래 걸린 회차가 스트림 즉사에도 리셋 자격을 얻으면 안 된다). 스트림이 끝나면 `Unhealthy` → 백오프 → 다음 회차. 첫 회차는 `Resynced` 또는 `Unhealthy` 중 하나를 반드시 보내며, Controller는 시작 시 머신마다 그 첫 통지를 기다린 뒤 메시지 세션을 연다(§7.1-7·8 → §7.1-9 순서. 첫 desired로 만든 unit의 die를 events가 받아야 한다). 시작 시 §7.1-7 동기화도 이 첫 회차의 `Resynced`다.
 
 preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 1. SSH 머신: host key 검증 후 접속(타임아웃 10s). local: 생략.
@@ -475,7 +475,7 @@ preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 
 5단계의 예산 판정(R21)만은 설정 값을 아는 Controller가 `Spec.Verify(info) error`로 넘긴다(machine은 config에 의존하지 않는다, §2). 에이전트는 이 오류를 R16과 같은 등급(`ErrFatal`)으로 다뤄 시작 시에는 그대로 올리고 재접속 후에는 `Failed`로 만든다. 접속 재료도 같은 이유로 `machine.SSH`(config.SSH의 값 복사)로 받는다.
 
-백오프: 1s 시작, ×2, 최대 30s, ±20% jitter, 성공 시 리셋. local 머신은 events 재시작에만 적용. [§7.1-8]
+백오프: 1s 시작, ×2, 최대 30s, ±20% jitter, 성공 시 리셋(성공의 기준은 위 회차 문단). local 머신은 events 재시작에만 적용. [§7.1-8]
 
 ## 8. 설정 로딩 (`internal/config`)  [§6]
 

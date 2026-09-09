@@ -248,7 +248,7 @@ func (a *Agent) Run(ctx context.Context, sink Sink) {
 	var bo Backoff
 	first := true
 	for {
-		served, err := a.serve(ctx, sink)
+		r := a.serve(ctx, sink)
 		if ctx.Err() != nil {
 			return
 		}
@@ -256,43 +256,58 @@ func (a *Agent) Run(ctx context.Context, sink Sink) {
 		// 스트림이 정상적으로 끝난 경우에도 버린다: events 를 싣고 있던 연결이므로 §10.1 의 재접속
 		// 경로(host key 검증 → preflight → 전체 동기화)를 그대로 탄다. local 은 연결이 없으므로
 		// healthy 였던 회차 뒤에는 events 재시작만 한다. [§7.1-8, §10.1]
-		if !served || !a.spec.Local {
+		if !r.served || !a.spec.Local {
 			a.dropConn()
 		}
-		if errors.Is(err, ErrFatal) {
-			a.log.Error("machine failed permanently, no reconnect", "err", err)
-			sink.Failed(a.name, err)
+		if errors.Is(r.err, ErrFatal) {
+			a.log.Error("machine failed permanently, no reconnect", "err", r.err)
+			sink.Failed(a.name, r.err)
 			return
 		}
-		if served || first {
+		if r.served || first {
 			// healthy 였던 스트림이 끝났다(또는 첫 회차가 실패했다): 재시작이 성공할 때까지 unhealthy.
 			// 다음 성공에서 Resynced 가 healthy 로 되돌린다.
-			sink.Unhealthy(a.name, err)
+			sink.Unhealthy(a.name, r.err)
 		}
-		if served {
+		if r.resetsBackoff() {
 			bo.Reset()
 		}
 		first = false
-		a.log.Warn("machine unhealthy, will retry", "err", err)
+		a.log.Warn("machine unhealthy, will retry", "err", r.err, "streamLife", r.life)
 		if bo.Wait(ctx) != nil {
 			return
 		}
 	}
 }
 
+// round 는 회차 하나의 결과다.
+type round struct {
+	served bool          // Resynced 까지 갔는가(= 그 회차가 healthy 였는가)
+	life   time.Duration // events 스트림이 열려 있던 시간
+	err    error
+}
+
+// resetsBackoff 는 이 회차가 백오프 수열을 되돌릴 자격이 있는지다. Resynced 를 보낸 것만으로는
+// 부족하다: 데몬이 뜨자마자 이벤트 한 건 내고 죽는 플래핑에서 매 회차 1s 로 리셋되면 지수 백오프가
+// 무력화된다. listener 세션과 같은 기준으로 스트림이 백오프 최대값 이상 유지된 회차만 성공으로 본다.
+// [§7.1-8 "성공 시 리셋", DESIGN §7, DESIGN §6 listener 세션]
+func (r round) resetsBackoff() bool { return r.served && r.life >= BackoffMax }
+
 // serve 는 회차 하나다: (필요 시) 접속·preflight → events 열기 → info 로 데몬 생존 확인 →
 // Observe → Resynced → 소비. 스트림이 끝난 이유를 돌려준다(정상 종료는 없다).
-// served 는 Resynced 까지 갔는지(= healthy)다.
-func (a *Agent) serve(ctx context.Context, sink Sink) (served bool, err error) {
+//
+// life 는 events 스트림이 열려 있던 시간이다(회차 전체가 아니다: pre-pull 이 오래 걸린 회차가
+// 스트림 즉사에도 리셋 자격을 얻으면 안 된다). 백오프 리셋 판정은 round.resetsBackoff.
+func (a *Agent) serve(ctx context.Context, sink Sink) round {
 	if !a.live {
 		if _, err := a.Preflight(ctx); err != nil {
-			return false, err
+			return round{err: err}
 		}
 	}
 	rt := a.Runtime()
 	if rt == nil { // Close 이후. 다음 회차가 다시 접속한다
 		a.live = false
-		return false, errors.New("접속 없음")
+		return round{err: errors.New("접속 없음")}
 	}
 	ectx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -302,6 +317,8 @@ func (a *Agent) serve(ctx context.Context, sink Sink) (served bool, err error) {
 	openTimer := time.AfterFunc(probeTimeout, cancel)
 	evCh, errCh := rt.Events(ectx, domain.UnitLabelFilter)
 	openTimer.Stop()
+	openedAt := time.Now()
+	life := func() time.Duration { return time.Since(openedAt) }
 	// 즉시 끝나야 하는 확인 명령에만 상한을 건다.
 	ictx, icancel := context.WithTimeout(ectx, probeTimeout)
 	info, err := rt.Info(ictx)
@@ -309,7 +326,7 @@ func (a *Agent) serve(ctx context.Context, sink Sink) (served bool, err error) {
 	if err != nil {
 		cancel()
 		drain(evCh, errCh)
-		return false, fmt.Errorf("info: %w", err)
+		return round{life: life(), err: fmt.Errorf("info: %w", err)}
 	}
 	// 회차마다 그 회차의 info 로 예산을 다시 판정한다(R21). preflight 를 건너뛰는 회차(local 의
 	// events 재시작)에도 위반이 드러나면 Failed 가 되어 goroutine 이 끝나야 하기 때문이다. [§7.1-3, R21]
@@ -317,14 +334,14 @@ func (a *Agent) serve(ctx context.Context, sink Sink) (served bool, err error) {
 		if err := a.spec.Verify(info); err != nil {
 			cancel()
 			drain(evCh, errCh)
-			return false, fatalf("머신 %q: %s", a.name, err)
+			return round{life: life(), err: fatalf("머신 %q: %s", a.name, err)}
 		}
 	}
 	snap, err := a.Observe(ectx)
 	if err != nil {
 		cancel()
 		drain(evCh, errCh)
-		return false, err
+		return round{life: life(), err: err}
 	}
 	snap.Info = info // 재접속으로 healthy 가 된 머신의 예산 재계산 재료 [§7.1-3, R21, R22]
 	// 스트림이 열리자마자 끝났으면(열기 실패) healthy 로 보고하지 않는다. Runtime.Events 는 열기 실패를
@@ -332,14 +349,14 @@ func (a *Agent) serve(ctx context.Context, sink Sink) (served bool, err error) {
 	select {
 	case err := <-errCh:
 		drain(evCh, nil)
-		return false, fmt.Errorf("events: %w", err)
+		return round{life: life(), err: fmt.Errorf("events: %w", err)}
 	default:
 	}
 	sink.Resynced(a.name, snap)
 	for ev := range evCh {
 		sink.Event(a.name, ev)
 	}
-	return true, <-errCh
+	return round{served: true, life: life(), err: <-errCh}
 }
 
 // drain 은 취소한 events 스트림을 끝까지 비운다(goroutine 누수 방지).

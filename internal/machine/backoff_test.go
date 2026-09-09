@@ -28,3 +28,22 @@ func TestBackoff_S7_1_8_Sequence(t *testing.T) {
 		t.Fatalf("jitter 상한 %v, want ≈1200ms", got)
 	}
 }
+
+// TestRound_S7_1_8_ResetsBackoff: 백오프 리셋 자격은 "Resynced 를 보냈는가"가 아니라 "스트림이
+// 30s 이상 유지됐는가"다. 데몬이 뜨자마자 이벤트 한 건 내고 죽는 플래핑에서 매 회차 1s 로 리셋되면
+// 지수 백오프가 무력화된다(§6 listener 세션과 동일 기준). [§7.1-8, DESIGN §7]
+func TestRound_S7_1_8_ResetsBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		r    round
+		want bool
+	}{
+		{"오래 유지된 healthy 스트림", round{served: true, life: BackoffMax}, true},
+		{"이벤트 한 건 내고 즉사(플래핑)", round{served: true, life: 50 * time.Millisecond}, false},
+		{"열기 실패는 오래 걸려도 리셋 없음", round{served: false, life: 2 * BackoffMax}, false},
+	} {
+		if got := tc.r.resetsBackoff(); got != tc.want {
+			t.Fatalf("%s: resetsBackoff=%v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
