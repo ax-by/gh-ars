@@ -71,9 +71,9 @@
 | `gh-ars.mode` | `none` \| `sidecar` |
 | `gh-ars.machine` | 머신 이름 (로그용. 소속 머신의 권위는 "SSH로 도달한 현재 머신" 또는 local) |
 
-볼륨에도 같은 라벨을 붙이되 `gh-ars.role`은 제외한다. 볼륨은 runner와 sidecar가 함께 마운트하는 unit 단위 부품이라 role 값이 없다(§9.1). 볼륨 조회는 특정 unit 정리 시 `gh-ars.unit=<unit>`, 머신 전체 동기화 시 `gh-ars.unit` 키 존재로 한다(후자는 고아·Foreign unit을 포함해야 하므로 값이나 scale set으로 거르지 않는다). slice 이름은 `gh-ars-<unit>.slice`.
+라벨은 events 스트림의 **구독 선택**에도 쓴다(`events --filter label=gh-ars.unit --filter type=container`): 스트림에 무엇이 실릴지는 라벨이 고르고, 그 안에서 unit/role을 **식별**하는 것은 컨테이너 이름이다(§7.1-8). 볼륨에도 같은 라벨을 붙이되 `gh-ars.role`은 제외한다. 볼륨은 runner와 sidecar가 함께 마운트하는 unit 단위 부품이라 role 값이 없다(§9.1). 볼륨 조회는 특정 unit 정리 시 `gh-ars.unit=<unit>`, 머신 전체 동기화 시 `gh-ars.unit` 키 존재로 한다(후자는 고아·Foreign unit을 포함해야 하므로 값이나 scale set으로 거르지 않는다). slice 이름은 `gh-ars-<unit>.slice`.
 
-**이름과 라벨의 역할 분담**: events 스트림에서는 컨테이너 이름 `gh-ars-<unit>-runner|sidecar`(§4.3)로 unit과 role을 식별한다. 이름은 docker/podman 두 runtime의 `die` 이벤트에 항상 포함되기 때문이다. 라벨은 `ps --filter` 조회, 볼륨·slice 대조, 입양 시 scale set/mode 복원에만 쓴다.
+**이름과 라벨의 역할 분담**: events 스트림에서는 컨테이너 이름 `gh-ars-<unit>-runner|sidecar`(§4.3)로 unit과 role을 식별한다. 이름은 docker/podman 두 runtime의 `die` 이벤트에 항상 포함되기 때문이다. 라벨은 스트림 구독 선택(`events --filter label=`), `ps --filter` 조회, 볼륨·slice 대조, 입양 시 scale set/mode 복원에 쓴다 — 무엇을 받을지는 라벨이 고르고, 받은 것이 어느 unit인지는 이름이 정한다.
 
 ### 4.3 명명
 - GitHub runner 이름: `<scaleSet>-<machine>-<unitId>`. GitHub 등록 ↔ 머신 컨테이너 1:1 대조 키. 64자 제한 → `len(scaleSet)+len(machine) ≤ 36` (§6.2 R14).
@@ -254,7 +254,7 @@ machines:
 [^group]: 조회가 그룹 단위라 다른 그룹에 있는 동명 scale set은 발견되지 않으므로 "있으면 그룹 이동" 분기는 도달 불가다. 그룹 이동은 non-goal(§3.2). 다른 그룹의 동명 scale set과 이름이 충돌하면 GitHub이 생성을 거부하고 gh-ars는 시작 실패한다.
 6. capacity 계산(R23, R24 동적 검증. R24는 도달한 머신 기준, 미도달 머신이 있으면 경고만).
 7. 전체 동기화: 머신마다 `ps -a --filter label=gh-ars.unit`(종료된 컨테이너 포함)로 unit 입양, 고아 정리(§8.3).
-8. events 스트림: SSH 머신은 유지되는 SSH 연결 위에, local 머신은 직접 `events`를 연다. 이벤트의 unit/role 식별은 컨테이너 이름 `gh-ars-<unit>-runner|sidecar`로 하고(§4.2), 라벨은 `ps --filter`·볼륨·slice 대조에만 쓴다. SSH 단절 → unhealthy, 재접속 시 전체 동기화 반복. 재접속은 지수 백오프(1s 시작, 2배, 최대 30s, ±20% jitter, 성공 시 리셋)로 시도하며 SSH 접속 타임아웃은 10s(코드 상수). local은 "연결 단절"이 없고 runtime 데몬 다운(events 스트림 종료 + `info` 실패)을 unhealthy로 보며, events 재시작에 같은 백오프를 쓴다.
+8. events 스트림: SSH 머신은 유지되는 SSH 연결 위에, local 머신은 직접 `events`를 연다. 이벤트의 unit/role 식별은 컨테이너 이름 `gh-ars-<unit>-runner|sidecar`로 하고(§4.2), 라벨은 스트림 구독 선택(`--filter label=`)과 `ps --filter`·볼륨·slice 대조에 쓴다. SSH 단절 → unhealthy, 재접속 시 전체 동기화 반복. 재접속은 지수 백오프(1s 시작, 2배, 최대 30s, ±20% jitter, 성공 시 리셋)로 시도하며 SSH 접속 타임아웃은 10s(코드 상수). local은 "연결 단절"이 없고 runtime 데몬 다운(events 스트림 종료 + `info` 실패)을 unhealthy로 보며, events 재시작에 같은 백오프를 쓴다.
 9. 메시지 세션 생성 후 루프 진입. `minRunners`만큼 warm runner는 루프의 desired 계산으로 자연히 배치된다.
 
 ### 7.2 루프
@@ -361,6 +361,8 @@ unit id를 알 수 없는 고아 등록(GenerateJIT 직후·컨테이너 create 
 | 정리 회차 상한 | 2분 | unit 정리(또는 startUnit 되돌리기) 1회 시도의 상한. 초과면 실패로 보고 Dying 유지, 다음 tick(30s)에서 재시도 |
 | preflight·관측 probe 상한 | 30s | preflight의 확인 명령(`id -u`, `info`)과 전체 동기화의 관측(`ps`, `volume ls`), events 스트림 **열기** 1회당(스트림 유지에는 상한이 없다). 초과면 그 회차 실패 → 머신 unhealthy → 백오프 재시도(§7.1-3, §7.1-7, §7.1-8) |
 | pre-pull 상한 | 5분 | 이미지 pull 1개당(§7.1-4). 초과면 pull 실패 → 그 머신 unhealthy. 이 값이 곧 응답 없는 pull이 세션 시작을 막을 수 있는 최악의 시간이다 |
+| SSH keepalive 주기 | 30s | 접속 하나당 생존 확인 주기(§10.1) |
+| SSH keepalive 허용 미스 | 3회 | 연속 실패가 이 수에 닿으면 단절로 보고 접속을 닫는다 → unhealthy → 재접속(§10.1). 응답이 오지 않는 프로브는 주기마다 1회 미스로 센다. 조용히 끊긴 접속을 걷어내는 최악의 시간은 `주기 × (미스 + 1)`(120s)다 — 첫 주기는 프로브를 보내는 데 쓰인다 |
 
 ## 9. sidecar 모드 상세
 
@@ -423,7 +425,9 @@ systemctl revert gh-ars-<unit>.slice                       # set-property 가 �
 - 인증: `keyFile` (+선택 `keyPassphrase`, `${env:}`/`${file:}` 참조 필수)만. host는 hostname/IP 직접 기입.
 - host key: `machines[].ssh.fingerprint` → `machineDefaults.ssh.knownHostsFile`(기본 `~/.ssh/known_hosts`) → 둘 다 없으면 거부. TOFU 없음.
 - 근거: JIT config(등록 자격 증명)를 SSH로 전달하므로 미검증 호스트 접속을 허용하지 않는다.
-- 연결은 머신당 유지(events 스트림 + 명령 실행 채널). 단절 시 unhealthy로 전환·경고 로그·capacity에서 제외. 재접속은 지수 백오프(1s 시작, 2배, 최대 30s, ±20% jitter, 성공 시 리셋), 시도 1회당 접속 타임아웃 10s. 재접속 성공 시 전체 동기화(§7.1-7) 후 healthy로 복귀.
+- 연결은 머신당 유지(events 스트림 + 명령 실행 채널). **명령 하나의 타임아웃·실패는 그 채널만 끝내고 연결을 끊지 않는다** — 연결을 끊으면 §8.3이 "Dying 유지 + 다음 tick 재시도"로 규정한 국소적 실패가 events 종료·머신 unhealthy·capacity 감소로 번진다. 연결을 끊는 것은 연결 수준 신호(keepalive 연속 실패, 전송 오류)와 프로세스 종료(§7.3)뿐이다.
+- 조용히 끊긴(half-open) 연결은 keepalive로 감지한다: 주기적으로 keepalive 요청을 보내고 연속 실패가 허용 미스(§8.3)에 닿으면 단절로 본다. 감지하지 못하면 events는 아무 말도 하지 않고 명령도 매달려, 죽은 머신이 healthy로 남아 계속 배치를 받고 그 unit들은 기동 타임아웃까지 매달렸다 실패하기를 반복한다.
+- 단절 시 unhealthy로 전환·경고 로그·capacity에서 제외. 재접속은 지수 백오프(1s 시작, 2배, 최대 30s, ±20% jitter, 성공 시 리셋), 시도 1회당 접속 타임아웃 10s. 재접속 성공 시 전체 동기화(§7.1-7) 후 healthy로 복귀.
 
 ### 10.2 SSH 사용자(및 local 실행 사용자) 권한 요구사항
 gh-ars는 root가 아닌 사용자로 실행할 때 root가 필요한 명령에만 `sudo -n`을 붙인다. preflight에서 아래 표의 항목을 확인하고 미충족이면 R16 오류(sidecar) 또는 unhealthy(none)로 처리한다.
@@ -432,6 +436,7 @@ gh-ars는 root가 아닌 사용자로 실행할 때 root가 필요한 명령에�
 1. `id -u`로 root 여부를 본다.
 2. docker: sudo를 쓰지 않는다. `docker info` 실패 → none은 unhealthy, sidecar는 R16 오류.
 3. podman: `podman info`를 시도하고, 실패하면 `sudo -n podman info`를 시도한다(모드 무관). 성공한 경로(sudo 없음 / `sudo -n`)를 그 머신의 podman 경로로 고정하고 이후 **모든 podman 명령**에 적용한다. 둘 다 실패 → none은 unhealthy, sidecar는 R16 오류.
+   고정은 **머신 단위로 프로세스 수명 동안** 유지한다: 재접속 preflight는 이 협상을 다시 하지 않고 고정된 경로만 시도하며, 그 경로가 실패하면 다른 경로로 갈아타지 않고 unhealthy로 둔다. rootless와 rootful은 컨테이너 저장소가 달라, 경로가 바뀌면 이미 실행 중인 unit이 보이지 않게 되고 전체 동기화가 그 부품을 "사라졌다"고 판정해 지운다(§8.3).
    sidecar scale set 머신은 추가로: 고정된 경로의 `Rootless=true`이면(rootless podman은 `podman info`가 성공하지만 sidecar에 못 쓴다) 아직 시도하지 않은 `sudo -n podman info`를 시도해 rootful을 얻으면 그 경로로 바꾼다. 그래도 rootful을 못 얻으면 R16 오류.
    none은 어느 경로든 성공하면 healthy(rootless 허용).
 4. systemctl: root가 아니면 항상 `sudo -n`.

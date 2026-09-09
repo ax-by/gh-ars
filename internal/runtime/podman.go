@@ -3,6 +3,7 @@ package runtime
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -12,8 +13,8 @@ import (
 
 // NewPodman 은 podman CLI 위의 Runtime 이다. sudo 는 §10.2 규칙 3(경로 고정)의 결과이며,
 // docker 와 달리 true 일 수 있다(rootful podman 을 passwordless sudo 로 쓰는 머신). [DESIGN §4.2]
-func NewPodman(ex executor.Executor, sudo bool) Runtime {
-	return &cli{kind: domain.RuntimePodman, bin: "podman", sudo: sudo, ex: ex, f: podmanFlavor{}}
+func NewPodman(ex executor.Executor, sudo bool, log *slog.Logger) Runtime {
+	return newCLI(domain.RuntimePodman, "podman", ex, sudo, podmanFlavor{}, log)
 }
 
 type podmanFlavor struct{}
@@ -89,7 +90,9 @@ func (podmanFlavor) parseEvent(line []byte) (Event, bool, error) {
 		return Event{}, false, fmt.Errorf("runtime: podman event 파싱: %w", err)
 	}
 	if e.Type != "container" {
-		return Event{}, false, nil // 관심 없는 줄(다른 type)
+		// 구독 argv 에 `--filter type=container` 가 있으므로(cli.go) 다른 type 이 오는 것은
+		// 데몬이 필터를 무시했거나 스키마가 바뀐 것이다: 이름 없는 줄과 같은 등급의 이상 신호다.
+		return Event{}, false, fmt.Errorf("runtime: podman event type %q(container 아님): %s", e.Type, line)
 	}
 	if e.Name == "" {
 		// 구독에 `--filter type=container` 가 걸려 있으므로 이름 없는 container 줄은 스키마가
@@ -136,6 +139,10 @@ func (podmanFlavor) parseInfo(out []byte) (Info, error) {
 	cgVersion := i.Host.CgroupVersion
 	if cgVersion == "v2" {
 		cgVersion = "2"
+	}
+	if i.Host.CPUs <= 0 || i.Host.MemTotal <= 0 {
+		// docker 쪽과 같은 이유: 예산 0 은 R21 에서 영구 Failed 로 번진다. [§7.1-3, R21]
+		return Info{}, fmt.Errorf("runtime: podman info 에 예산이 없다(cpus=%d, memTotal=%d)", i.Host.CPUs, i.Host.MemTotal)
 	}
 	return Info{
 		CPUs:          float64(i.Host.CPUs),

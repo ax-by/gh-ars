@@ -1,8 +1,10 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -15,7 +17,7 @@ import (
 func newPodmanFake(t *testing.T, sudo bool) (*fakeExec, Runtime) {
 	t.Helper()
 	f := &fakeExec{t: t}
-	return f, NewPodman(f, sudo)
+	return f, NewPodman(f, sudo, testLogger())
 }
 
 // [DESIGN §4.2, §10.2 규칙 3] podman 은 docker 와 달리 sudo 가 true 일 수 있고(rootful podman
@@ -91,10 +93,16 @@ func TestPodman_S9_2_InfoParse(t *testing.T) {
 		t.Fatalf("Info = %+v, want %+v", got, want)
 	}
 	// rootful (Rootless=false) 도 그대로 전달된다.
-	f.results = []executor.Result{{Stdout: []byte(`{"host":{"cgroupManager":"systemd","cgroupVersion":"v2","security":{"rootless":false}}}`)}}
+	f.results = []executor.Result{{Stdout: []byte(`{"host":{"cgroupManager":"systemd","cgroupVersion":"v2","cpus":4,"memTotal":8589934592,"security":{"rootless":false}}}`)}}
 	got, err = rt.Info(context.Background())
 	if err != nil || got.Rootless {
 		t.Fatalf("Info = %+v, err = %v, want Rootless=false", got, err)
+	}
+	// 예산이 없는 info(스키마 어긋남)는 조용한 0 이 아니라 오류다: 0 은 R21 에서 physicalMax 0 →
+	// 영구 Failed 로 번지는데, 원인은 스키마 불일치이므로 재시도 가능한 unhealthy 여야 한다. [§7.1-3, R21]
+	f.results = []executor.Result{{Stdout: []byte(`{"host":{"cgroupManager":"systemd","cgroupVersion":"v2","security":{"rootless":false}}}`)}}
+	if _, err := rt.Info(context.Background()); err == nil {
+		t.Fatal("cpus·memTotal 이 없는 info 가 성공으로 처리됐다")
 	}
 }
 
@@ -146,7 +154,7 @@ func TestPodman_S4_2_EventsNormalize(t *testing.T) {
 	if !ok || err == nil {
 		t.Fatalf("스트림 종료 통지가 없다: ok=%v err=%v", ok, err)
 	}
-	if !strings.Contains(err.Error(), "읽지 못한 줄 1개") {
+	if !strings.Contains(err.Error(), "읽지 못한 줄 2개") { // 깨진 JSON 1 + network 1
 		t.Fatalf("파싱 실패가 종료 오류에 실리지 않았다: %v", err)
 	}
 }
@@ -181,8 +189,34 @@ func TestPodman_S4_2_EventWithoutNameIsUnparseable(t *testing.T) {
 	if ok || err == nil {
 		t.Fatalf("ok=%v err=%v, want 읽지 못한 줄", ok, err)
 	}
+	// 구독이 type=container 로 좁혀져 있으므로 다른 type 이 오는 것도 이상 신호다.
 	_, ok, err = podmanFlavor{}.parseEvent([]byte(`{"Type":"network","Status":"connect","Name":"bridge","time":1788934695}`))
-	if ok || err != nil {
-		t.Fatalf("ok=%v err=%v, want 관심 없는 줄(오류 아님)", ok, err)
+	if ok || err == nil {
+		t.Fatalf("ok=%v err=%v, want 읽지 못한 줄", ok, err)
+	}
+}
+
+// TestEvents_S4_2_FirstUnparseableLineWarns: 첫 읽지 못한 줄은 즉시 경고로 남는다. 스키마가
+// 통째로 어긋나면 스트림은 열린 채 유지되고 모든 줄이 버려지는데, 종료 오류만으로는 그 신호가
+// 영영 나오지 않기 때문이다(재시작 트리거가 오지 않는다). [DESIGN §4.2, §7.1-8]
+func TestEvents_S4_2_FirstUnparseableLineWarns(t *testing.T) {
+	var logs bytes.Buffer
+	f := &fakeExec{}
+	f.stream = strings.Join([]string{
+		`{"Type":"container","Status":"died","time":1788934694}`, // 이름 없음 → 읽지 못한 줄
+		`{"Type":"container","Status":"died","Name":"gh-ars-X-runner","time":1788934695}`,
+		"",
+	}, "\n")
+	rt := NewPodman(f, false, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	evCh, errCh := rt.Events(context.Background(), "gh-ars.unit")
+	for range evCh {
+	}
+	<-errCh
+	if !strings.Contains(logs.String(), "읽지 못했다") {
+		t.Fatalf("첫 실패 줄에 대한 경고가 없다: %q", logs.String())
+	}
+	if n := strings.Count(logs.String(), "읽지 못했다"); n != 1 {
+		t.Fatalf("경고 %d회, want 1 (이후는 종료 오류의 집계로 갈음)", n)
 	}
 }

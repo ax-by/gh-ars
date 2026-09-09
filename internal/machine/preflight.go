@@ -111,7 +111,7 @@ func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runti
 	switch a.spec.Runtime {
 	case domain.RuntimeDocker:
 		// 규칙 2: docker 는 sudo 를 쓰지 않는다(docker 그룹 멤버 또는 root).
-		rt := runtime.NewDocker(ex, false)
+		rt := runtime.NewDocker(ex, false, a.log)
 		info, err := probeInfo(ctx, rt)
 		if err != nil {
 			return nil, false, runtime.Info{}, a.infoFailure("docker info", err)
@@ -123,7 +123,7 @@ func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runti
 		// 갈아타지 않고 unhealthy 로 둔다(다음 재접속에서 같은 경로를 다시 시도한다). [§10.2 규칙 3]
 		if a.podmanSudo != nil {
 			sudo := *a.podmanSudo
-			rt := runtime.NewPodman(ex, sudo)
+			rt := runtime.NewPodman(ex, sudo, a.log)
 			info, err := probeInfo(ctx, rt)
 			if err != nil {
 				return nil, false, runtime.Info{}, a.infoFailure("podman info", err)
@@ -135,11 +135,11 @@ func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runti
 		}
 		// 규칙 3: `podman info` → 실패하면 `sudo -n podman info`. 성공한 쪽을 고정한다.
 		sudo := false
-		rt := runtime.NewPodman(ex, false)
+		rt := runtime.NewPodman(ex, false, a.log)
 		info, err := probeInfo(ctx, rt)
 		if err != nil {
 			sudo = true
-			rt = runtime.NewPodman(ex, true)
+			rt = runtime.NewPodman(ex, true, a.log)
 			info2, err2 := probeInfo(ctx, rt)
 			if err2 != nil {
 				return nil, false, runtime.Info{}, a.infoFailure("podman info", errors.Join(err, err2))
@@ -150,7 +150,7 @@ func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runti
 		// `sudo -n podman info` 로 rootful 을 얻으면 그 경로로 바꾸고, 못 얻으면 R16 오류.
 		if a.spec.Mode == domain.ModeSidecar && info.Rootless {
 			if !sudo {
-				sudoRT := runtime.NewPodman(ex, true)
+				sudoRT := runtime.NewPodman(ex, true, a.log)
 				if sudoInfo, err := probeInfo(ctx, sudoRT); err == nil && !sudoInfo.Rootless {
 					a.log.Info("podman path fixed", "sudo", true, "rootless", false)
 					a.podmanSudo = ptr(true)

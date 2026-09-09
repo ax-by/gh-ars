@@ -11,8 +11,10 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -38,9 +40,27 @@ type SSHConfig struct {
 	Log *slog.Logger
 }
 
+// keepalive 상수. SPEC §8.3 상수 표를 따른다.
+const (
+	// sshKeepaliveInterval 은 연결 수준 생존 확인 주기다. [§8.3 "SSH keepalive 주기"]
+	sshKeepaliveInterval = 30 * time.Second
+	// sshKeepaliveMaxMiss 는 연속 실패 허용 횟수다. 닿으면 단절로 보고 접속을 닫아 §10.1 의
+	// "단절 → unhealthy → 재접속" 경로로 보낸다. 첫 주기는 프로브를 보내는 데 쓰이므로 조용히
+	// 끊긴 접속을 걷어내는 최악의 시간은 `주기 × (미스 + 1)` = 120s 다. [§8.3 "SSH keepalive 허용 미스"]
+	sshKeepaliveMaxMiss = 3
+)
+
 // sshExecutor 는 머신 하나에 대한 SSH 접속을 유지한다. [§10.1]
+//
+// 접속을 닫는 주체는 둘뿐이다: 명시적 Close 와 keepalive 판정(연결 수준 신호). 명령 하나의
+// ctx 만료·드레인 상한은 그 채널만 닫는다 — DESIGN §4.1 이 ctx 취소를 명령 단위의 정상적인
+// 결과로 규정하고 local 구현도 프로세스만 죽이므로, 여기서 접속을 파괴하면 같은 계약이 두
+// 구현에서 다르게 동작하고 events 스트림·동시 실행 중인 다른 명령까지 함께 끊긴다. [DESIGN §4.1, §10.1]
 type sshExecutor struct {
 	client *ssh.Client
+	log    *slog.Logger
+	stop   chan struct{} // keepalive 종료
+	once   sync.Once
 }
 
 // NewSSH 는 접속을 맺고 유지하는 Executor 를 만든다. host key 검증 순서는 R20:
@@ -65,55 +85,210 @@ func NewSSH(cfg SSHConfig) (Executor, error) {
 		return nil, fmt.Errorf("executor/ssh: 키 파일 %s: %w", cfg.KeyFile, err)
 	}
 	clientCfg := &ssh.ClientConfig{
-		User:              cfg.User,
-		Auth:              []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback:   hostKeyCB,
-		HostKeyAlgorithms: hostKeyPreference,
+		User:            cfg.User,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: hostKeyCB,
 	}
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	deadline := time.Now().Add(sshConnectTimeout)
-	client, err := dialSSH(addr, clientCfg, deadline)
-	// known_hosts 에 그 호스트의 다른 키 타입만 있으면 검증이 "key mismatch" 로 실패한다. 그때
-	// KeyError.Want 가 파일이 실제로 가진 키들을 알려주므로, 그 타입들로 한 번 더 시도한다.
-	// (파일 매칭 규칙 — 와일드카드·해시 항목 — 은 라이브러리가 이미 안다. 우리가 다시 파싱하지
-	// 않는 이유다.) 재시도도 같은 10s 예산 안에서 한다. [§10.1, R20]
-	var keyErr *knownhosts.KeyError
-	if err != nil && errors.As(err, &keyErr) && len(keyErr.Want) > 0 {
-		retryCfg := *clientCfg
-		retryCfg.HostKeyAlgorithms = knownKeyTypes(keyErr.Want)
-		if len(retryCfg.HostKeyAlgorithms) > 0 {
-			log.Debug("executor/ssh: known_hosts 의 키 타입으로 재시도", "host", cfg.Host, "algos", retryCfg.HostKeyAlgorithms)
-			client, err = dialSSH(addr, &retryCfg, deadline)
+	// 시도 계획: fingerprint 는 기록된 키의 계열을 알 수 없으므로 계열을 차례로 본다(불일치는
+	// "다른 계열이 협상됐다" 일 수 있다). 그 밖의 검증(known_hosts·우회)은 한 번에 전부 제시하고,
+	// known_hosts 가 "key mismatch" 를 내면 파일이 실제로 가진 키 계열로 한 번 더 시도한다 —
+	// KeyError.Want 가 그것을 알려주므로 파일 매칭 규칙(와일드카드·해시 항목)을 우리가 다시
+	// 구현하지 않아도 된다. 모든 시도는 같은 10s 예산 안에서 한다. [§10.1, R20]
+	plan := [][]string{hostKeyPreference}
+	if cfg.Fingerprint != "" {
+		plan = hostKeyFamilies
+	}
+	var client *ssh.Client
+	for _, algos := range plan {
+		clientCfg.HostKeyAlgorithms = algos
+		client, err = dialSSH(addr, clientCfg, deadline)
+		if err == nil {
+			break
 		}
+		var keyErr *knownhosts.KeyError
+		if errors.As(err, &keyErr) && len(keyErr.Want) > 0 {
+			if types := knownKeyTypes(keyErr.Want); len(types) > 0 {
+				log.Debug("executor/ssh: known_hosts 의 키 계열로 재시도", "host", cfg.Host, "algos", types)
+				clientCfg.HostKeyAlgorithms = types
+				client, err = dialSSH(addr, clientCfg, deadline)
+			}
+			break
+		}
+		// fingerprint 계획에서는 **어떤 실패든** 다음 계열을 시도한다. 지문 불일치뿐 아니라
+		// "no common algorithm for host key"(서버에 그 계열 키가 아예 없는 경우)도 다음 계열에서
+		// 풀리기 때문이다 — 그 오류에서 멈추면 ed25519 host key 가 없는 서버에는 영영 못 붙는다.
+		// 시도 횟수는 계열 수(3)와 10s 예산이 함께 묶는다.
+		if len(plan) == 1 || !time.Now().Before(deadline) {
+			break
+		}
+		log.Debug("executor/ssh: host key 협상 실패, 다음 키 계열로 재시도", "host", cfg.Host, "err", err)
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &sshExecutor{client: client}, nil
+	e := &sshExecutor{client: client, log: log, stop: make(chan struct{})}
+	go e.keepalive()
+	return e, nil
 }
 
-// hostKeyPreference 는 OpenSSH 의 host key 선호 순서다. x/crypto 의 기본값은 ed25519 를 마지막에
-// 두어 서버가 ecdsa/rsa 를 고르게 만드는데, 사용자가 기록해 둔 fingerprint·known_hosts 항목은
-// 보통 OpenSSH 가 협상한 ed25519 다. 순서를 맞추지 않으면 `ssh user@host` 는 되는 정상 호스트가
-// gh-ars 에서만 host key 불일치로 거부된다. [§10.1, R20]
-var hostKeyPreference = []string{
-	ssh.KeyAlgoED25519,
-	ssh.KeyAlgoECDSA256, ssh.KeyAlgoECDSA384, ssh.KeyAlgoECDSA521,
-	ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSA,
+// keepalive 는 연결 수준 생존 확인이다. half-open(조용히 끊긴) 접속은 events 스트림이
+// 아무 말도 하지 않고 명령도 TCP 재전송이 끝날 때까지 매달리므로, 머신이 healthy 로 남아
+// 계속 배치를 받고 그 unit 들은 기동 타임아웃까지 매달렸다 실패하기를 반복한다. 주기적으로
+// keepalive 요청을 보내 연속 실패가 상한을 넘으면 접속을 닫아 단절로 만든다. [§10.1, §8.3]
+func (e *sshExecutor) keepalive() {
+	t := time.NewTicker(sshKeepaliveInterval)
+	defer t.Stop()
+	keepaliveLoop(e.stop, t.C, func() error {
+		_, _, err := e.client.SendRequest("keepalive@openssh.com", true, nil)
+		return err
+	}, sshKeepaliveMaxMiss, func(err error) {
+		e.log.Warn("executor/ssh: keepalive 연속 실패, 접속을 닫는다", "misses", sshKeepaliveMaxMiss, "err", err)
+		_ = e.client.Close()
+	})
 }
 
-// knownKeyTypes 는 known_hosts 가 그 호스트에 대해 가진 키 타입들이다(중복 제거, 파일 순서 유지).
-func knownKeyTypes(want []knownhosts.KnownKey) []string {
-	var out []string
-	seen := map[string]bool{}
-	for _, k := range want {
-		if k.Key == nil {
-			continue
+// errKeepaliveNoReply 는 한 주기 안에 응답이 오지 않은 프로브다.
+var errKeepaliveNoReply = errors.New("executor/ssh: keepalive 응답 없음")
+
+// keepaliveLoop 은 keepalive 의 판정 부분이다(테스트가 시계와 전송을 넣는다).
+//
+// 프로브를 tick 안에서 **동기로** 부르면 안 된다: `SendRequest(wantReply=true)` 는 응답이
+// 오거나 접속이 죽을 때까지 막히는데, half-open 접속에서는 그 시점이 TCP 스택이 포기할 때
+// (Linux 기본 ≈15분)라 §8.3 이 약속한 `주기 × 미스`(90s) 상한이 무너진다. 그래서 프로브는
+// goroutine 으로 띄우고, **다음 tick 까지 응답이 없으면 그 자체를 miss 로 센다**
+// (OpenSSH 의 ServerAliveInterval/ServerAliveCountMax 와 같은 의미론). 프로브는 한 번에
+// 하나만 띄운다 — x/crypto 의 SendRequest 는 직렬화되므로 겹쳐 띄워도 대기만 늘어난다.
+func keepaliveLoop(stop <-chan struct{}, tick <-chan time.Time, send func() error, maxMiss int, onDead func(error)) {
+	res := make(chan error, 1) // 버려진 프로브가 남아도 쓰기가 막히지 않게 버퍼 1
+	var st keepaliveState
+	for {
+		select {
+		case <-stop:
+			return
+		case err := <-res:
+			if st.result(err, maxMiss) {
+				onDead(err)
+				return
+			}
+		case <-tick:
+			// tick 직전에 도착한 결과가 있으면 먼저 반영한다: 그 프로브는 응답한 것이므로
+			// "응답 없음" 으로 세면 안 된다.
+			select {
+			case err := <-res:
+				if st.result(err, maxMiss) {
+					onDead(err)
+					return
+				}
+			default:
+			}
+			probe, dead := st.tick(maxMiss)
+			if dead {
+				onDead(errKeepaliveNoReply)
+				return
+			}
+			if probe {
+				go func() { res <- send() }()
+			}
 		}
-		t := k.Key.Type()
-		if !seen[t] {
-			seen[t] = true
-			out = append(out, t)
+	}
+}
+
+// keepaliveState 는 keepalive 판정의 상태 기계다. 시간도 전송도 모르고 세기만 하므로
+// 유닛 테스트가 표로 검증한다(루프는 이것을 구동만 한다). [§10.1, §8.3]
+type keepaliveState struct {
+	miss     int
+	inflight bool
+}
+
+// result 는 프로브 결과를 반영한다. 상한에 닿으면 true.
+func (s *keepaliveState) result(err error, maxMiss int) bool {
+	s.inflight = false
+	if err == nil {
+		s.miss = 0
+		return false
+	}
+	s.miss++
+	return s.miss >= maxMiss
+}
+
+// tick 은 주기 도래를 반영한다. probe 면 새 프로브를 띄워야 하고, dead 면 상한 도달이다
+// (지난 주기의 프로브가 아직 응답하지 않은 것 자체가 miss 다).
+func (s *keepaliveState) tick(maxMiss int) (probe, dead bool) {
+	if s.inflight {
+		s.miss++
+		return false, s.miss >= maxMiss
+	}
+	s.inflight = true
+	return true, false
+}
+
+// errFingerprintMismatch 는 제시된 host key 의 지문이 설정과 다르다는 뜻이다. 타입을 바꿔
+// 한 번 더 시도할지 판단하는 데 쓴다(아래 NewSSH). [§10.1, R20]
+var errFingerprintMismatch = errors.New("host key fingerprint 불일치")
+
+// hostKeyPreference 는 x/crypto 가 지원하는 host key 알고리즘을 OpenSSH 순서(ed25519 → ecdsa
+// → rsa)로 다시 정렬한 것이다. 목록을 손으로 새로 쓰지 않는다: 그러면 인증서 알고리즘
+// (`@cert-authority` known_hosts)이 빠지거나, 라이브러리가 보안 문제로 제외한 `ssh-rsa`
+// (SHA-1 서명)를 되살리게 된다.
+//
+// 정렬이 필요한 이유: x/crypto 의 기본 순서는 ed25519 를 뒤에 두어 서버가 ecdsa/rsa 를 고르는데,
+// 사용자가 기록해 둔 known_hosts 항목·fingerprint 는 보통 OpenSSH 가 협상한 ed25519 다. 순서를
+// 맞추지 않으면 `ssh user@host` 는 되는 정상 호스트가 gh-ars 에서만 거부된다. [§10.1, R20]
+var hostKeyPreference = sortByFamily(ssh.SupportedAlgorithms().HostKeys)
+
+// hostKeyFamilies 는 같은 순서를 계열별로 묶은 것이다. fingerprint 는 어떤 계열의 키를 기록해
+// 둔 것인지 알 수 없으므로, 불일치가 나면 다음 계열로 넘어가며 차례로 시도한다. [§10.1, R20]
+var hostKeyFamilies = groupByFamily(hostKeyPreference)
+
+// hostKeyFamily 는 알고리즘 이름의 계열 순위다(작을수록 먼저). 인증서 변형은 같은 계열이다.
+func hostKeyFamily(algo string) int {
+	switch {
+	case strings.Contains(algo, "ed25519"):
+		return 0
+	case strings.Contains(algo, "ecdsa"):
+		return 1
+	default: // rsa 및 그 밖
+		return 2
+	}
+}
+
+func sortByFamily(algos []string) []string {
+	out := append([]string(nil), algos...)
+	sort.SliceStable(out, func(i, j int) bool { return hostKeyFamily(out[i]) < hostKeyFamily(out[j]) })
+	return out
+}
+
+func groupByFamily(sorted []string) [][]string {
+	var out [][]string
+	for i, algo := range sorted {
+		if i == 0 || hostKeyFamily(algo) != hostKeyFamily(sorted[i-1]) {
+			out = append(out, nil)
+		}
+		out[len(out)-1] = append(out[len(out)-1], algo)
+	}
+	return out
+}
+
+// knownKeyTypes 는 known_hosts 가 그 호스트에 대해 가진 키로 **협상 가능한 서명 알고리즘**
+// 목록을 만든다(선호 순서 유지, 중복 제거).
+//
+// RSA 키의 Type() 은 "ssh-rsa"(SHA-1 서명)인데 x/crypto 는 그것을 지원 목록에서 빼 두었고
+// OpenSSH 8.8+ 도 기본값에서 끈다. 그래서 같은 계열의 지원 알고리즘(rsa-sha2-256/512)으로
+// 펼친다 — 그러지 않으면 RSA 항목만 있는 known_hosts 에서 "no common algorithm" 으로 협상
+// 자체가 실패한다. [§10.1, R20]
+func knownKeyTypes(want []knownhosts.KnownKey) []string {
+	families := map[int]bool{}
+	for _, k := range want {
+		if k.Key != nil {
+			families[hostKeyFamily(k.Key.Type())] = true
+		}
+	}
+	var out []string
+	for _, algo := range hostKeyPreference {
+		if families[hostKeyFamily(algo)] {
+			out = append(out, algo)
 		}
 	}
 	return out
@@ -159,7 +334,7 @@ func sshHostKeyCallback(cfg SSHConfig, log *slog.Logger) (ssh.HostKeyCallback, e
 		return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
 			got := ssh.FingerprintSHA256(key)
 			if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
-				return fmt.Errorf("host key fingerprint 불일치: got %s, want %s", got, want)
+				return fmt.Errorf("%w: got %s, want %s", errFingerprintMismatch, got, want)
 			}
 			return nil
 		}, nil
@@ -231,11 +406,10 @@ type openExecResult struct {
 }
 
 // openExec 는 실행 채널을 열고 명령을 시작한다. `ssh.Session` 대신 raw Channel
-// API를 쓰는 이유는 Run/Stream 의 doc 참조. ctx 가 먼저 끝나면 접속 전체를 닫아
-// 강제로 푼다: 채널 열기·exec 요청의 응답은 라이브러리 내부에서 기다려 개별
-// 요청만 취소할 방법이 없다(DESIGN §4.1). 접속을 끊으면 이 머신의 다른 세션도
-// 함께 끊기지만, 응답 없는 피어는 사실상 단절과 같아 machine 층의 재접속
-// 백오프(§10.1)에 맡긴다.
+// API를 쓰는 이유는 Run/Stream 의 doc 참조. 채널 열기·exec 요청의 응답은 라이브러리
+// 내부에서 기다려 개별 요청만 취소할 방법이 없으므로, ctx 가 먼저 끝나면 기다리지 않고
+// 반환하고 열기가 끝나는 대로 **그 채널만** 닫는다. 접속은 끊지 않는다 — 그것은 이 머신의
+// events 스트림과 다른 명령까지 함께 끊는다(§10.1). 정말 죽은 접속은 keepalive 가 걷어낸다.
 func (e *sshExecutor) openExec(ctx context.Context, cmdStr string) (ssh.Channel, <-chan *ssh.Request, error) {
 	out := make(chan openExecResult, 1)
 	go func() {
@@ -259,11 +433,13 @@ func (e *sshExecutor) openExec(ctx context.Context, cmdStr string) (ssh.Channel,
 	case r := <-out:
 		return r.ch, r.reqs, r.err
 	case <-ctx.Done():
-		_ = e.client.Close()
-		r := <-out // 고루틴 회수(누수 방지)
-		if r.ch != nil {
-			go func() { _ = r.ch.Close() }()
-		}
+		// 접속은 건드리지 않는다: 열기가 끝나면 그 채널만 닫는다(열기 자체가 원격 응답을
+		// 기다리므로 여기서 기다리지 않고 배경으로 넘긴다). [DESIGN §4.1]
+		go func() {
+			if r := <-out; r.ch != nil {
+				_ = r.ch.Close()
+			}
+		}()
 		return nil, nil, ctx.Err()
 	}
 }
@@ -312,11 +488,15 @@ func waitTwo(a, b <-chan struct{}, timeout time.Duration) bool {
 	return true
 }
 
-// waitAllOrClose 는 dones 가 모두 닫히기를 상한 안에서 기다린다. 못 끝나면 접속
-// 전체를 닫아(client, 로컬 소켓만 닫아 원격 응답 없이도 즉시 푼다) 나머지를
-// 강제로 회수한 뒤에야 반환한다 — 그래서 이 함수가 반환하면 dones 는 항상 전부
-// 닫혀 있다(호출자가 그 뒤 goroutine 을 새로 만들지 않아도 된다). [DESIGN §4.1]
-func waitAllOrClose(client *ssh.Client, timeout time.Duration, dones ...<-chan struct{}) {
+// waitAll 은 dones 가 모두 닫히기를 상한 안에서 기다린다. 못 끝나면 false 를 돌려주고
+// **그대로 반환한다**: 남은 goroutine 은 버린다(접속을 닫아 강제로 회수하지 않는다).
+//
+// 예전에는 여기서 접속을 닫았는데, 그러면 명령 하나의 상한 초과가 그 머신의 events 스트림과
+// 동시 실행 중인 다른 명령까지 끊었다(DESIGN §4.1 의 Executor 계약 위반). 버려진 goroutine 은
+// 원격이 응답하거나 접속이 끝날 때 함께 사라지고, 접속 자체가 죽어 있으면 keepalive 가 걷어낸다.
+// 버려도 안전한 이유: 그들이 쓰는 버퍼(capBuffer)는 잠금이 있고, 호출자는 이 시점 이후 그
+// 출력을 값으로 돌려주지 않는다. [DESIGN §4.1, §10.1]
+func waitAll(timeout time.Duration, dones ...<-chan struct{}) bool {
 	combined := make(chan struct{})
 	go func() {
 		for _, d := range dones {
@@ -326,9 +506,9 @@ func waitAllOrClose(client *ssh.Client, timeout time.Duration, dones ...<-chan s
 	}()
 	select {
 	case <-combined:
+		return true
 	case <-time.After(timeout):
-		_ = client.Close()
-		<-combined
+		return false
 	}
 }
 
@@ -337,11 +517,12 @@ func waitAllOrClose(client *ssh.Client, timeout time.Duration, dones ...<-chan s
 // 이미 확보했으니 이건 그냥 뒷정리다. `ch.Close()`의 packet write 도, stdin
 // 복사의 `ch.Write()`도 SSH 흐름 제어 윈도우가 막히면 무기한 걸릴 수 있어
 // (원격이 이미 죽었는데 그 사실을 우리가 모르는 경우), 배경 goroutine 이
-// `waitAllOrClose`로 상한을 두고 감시하다가 못 끝나면 접속 전체를 닫는다. [DESIGN §4.1]
-func closeChannelBounded(client *ssh.Client, ch ssh.Channel, stdinDone <-chan struct{}, timeout time.Duration) {
+// `waitAll`로 상한을 두고 감시하다가 못 끝나면 **그 goroutine 을 버린다**
+// (접속은 유지한다 — 죽은 접속은 keepalive 가 걷어낸다). [DESIGN §4.1, §10.1]
+func closeChannelBounded(ch ssh.Channel, stdinDone <-chan struct{}, timeout time.Duration) {
 	closeReq := make(chan struct{})
 	go func() { _ = ch.Close(); close(closeReq) }()
-	go waitAllOrClose(client, timeout, closeReq, stdinDone)
+	go waitAll(timeout, closeReq, stdinDone)
 }
 
 // Run 은 명령이 끝날 때까지 기다린다. 종료 코드는 오류가 아니라 값이다(Executor 참조).
@@ -394,16 +575,22 @@ func (e *sshExecutor) Run(ctx context.Context, c Cmd) (Result, error) {
 		if !waitTwo(stdoutDone, stderrDone, pipeDrainDelay) {
 			// Channel.Close() 는 종료 "요청" 메시지만 보낸다 — 로컬 Read 가 실제로
 			// 풀리려면(pending.eof) 원격이 close 확인을 보내야 하는데, 원격이 이미
-			// grandchild 때문에 막혀 있는 상황이라 그 확인도 늦을 수 있다. 접속
-			// 전체(Client.Close, 로컬 소켓만 닫는 동작)를 닫아야 확실히 풀린다. [DESIGN §4.1]
-			_ = e.client.Close()
-			<-stdoutDone
-			<-stderrDone
-			<-stdinDone
+			// grandchild 때문에 막혀 있는 상황이라 그 확인도 늦을 수 있다. 그래도 접속은
+			// 닫지 않는다: 상한까지 기다린 뒤 남은 goroutine 을 버린다. [DESIGN §4.1, §10.1]
+			closeChannelBounded(ch, stdinDone, pipeDrainDelay)
+			// 상한 안에 안 풀리면 복사 goroutine 은 버린다. 접속을 닫아 강제 회수하지 않는다:
+			// 그것은 이 머신의 events 스트림과 다른 명령까지 끊는다. [DESIGN §4.1]
+			recovered := waitAll(pipeDrainDelay, stdoutDone, stderrDone, stdinDone)
+			// 버린 goroutine 이 아직 쓰고 있을 수 있으므로 그때는 버퍼를 읽지 않는다(bytes.Buffer 는
+			// 잠금이 없다). 회수됐을 때만 stderr 를 오류에 싣는다.
+			detail := ""
+			if recovered {
+				detail = stderr.String()
+			}
 			return Result{}, withStderr(fmt.Sprintf("executor/ssh: %s: %v 안에 출력이 다 오지 않았다", strings.Join(argv, " "), pipeDrainDelay),
-				errPipeDrainTimeout, stderr.String())
+				errPipeDrainTimeout, detail)
 		}
-		closeChannelBounded(e.client, ch, stdinDone, pipeDrainDelay) // 결과는 이미 확보했다. Close 자체는 상한만 지키면 된다
+		closeChannelBounded(ch, stdinDone, pipeDrainDelay) // 결과는 이미 확보했다. Close 자체는 상한만 지키면 된다
 		// exitCh 를 기다리는 동안이나 드레인 상한(최대 pipeDrainDelay) 동안 ctx 가
 		// 끝났을 수 있다. 그새 명령이 실제로 성공했더라도 오류는 "프로세스를 시작
 		// 못한 경우와 ctx 취소뿐"이라는 계약대로 ctx 취소를 값보다 우선 보고한다. [DESIGN §4.1]
@@ -420,11 +607,13 @@ func (e *sshExecutor) Run(ctx context.Context, c Cmd) (Result, error) {
 		}
 		return Result{Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), ExitCode: er.code}, nil
 	case <-ctx.Done():
-		_ = e.client.Close() // 응답 없는 접속까지 확실히 푼다(openExec 문서 참조)
-		<-exitCh             // 고루틴 회수(누수 방지)
-		<-stdoutDone
-		<-stderrDone
-		<-stdinDone
+		// 명령 하나의 ctx 만료는 그 채널만 닫는다. 접속을 닫으면 §8.3 이 "Dying 유지 + 다음 tick
+		// 재시도" 로 규정한 국소적 실패가 머신 unhealthy·capacity 감소·전체 재동기화로 번진다.
+		// 상한 안에 회수되지 않은 goroutine 은 버린다(위 waitAll 주석). [DESIGN §4.1, §8.3]
+		closeChannelBounded(ch, stdinDone, pipeDrainDelay)
+		exitDone := make(chan struct{})
+		go func() { <-exitCh; close(exitDone) }()
+		waitAll(pipeDrainDelay, exitDone, stdoutDone, stderrDone, stdinDone)
 		return Result{}, fmt.Errorf("executor/ssh: %s: %w", argv[0], ctx.Err())
 	}
 }
@@ -457,14 +646,15 @@ func (e *sshExecutor) Stream(ctx context.Context, c Cmd) (io.ReadCloser, error) 
 	go func() { _, stdoutErr = io.Copy(outW, ch); close(stdoutDone) }()
 	go func() { _, stderrErr = io.Copy(stderr, ch.Stderr()); close(stderrDone) }()
 
-	s := &sshStream{client: e.client, pr: outR, ch: ch, done: make(chan struct{}), stdinDone: stdinDone}
+	s := &sshStream{pr: outR, ch: ch, done: make(chan struct{}), stdinDone: stdinDone}
 	go func() {
 		defer close(s.done)
 		code, exitErr := waitExit(reqs)
 		if !waitTwo(stdoutDone, stderrDone, pipeDrainDelay) {
-			// Run 과 같은 이유로 채널이 아니라 접속 전체를 닫는다: Channel.Close() 는
-			// 요청만 보내고, 로컬 Read 를 실제로 푸는 것은 원격의 close 확인이다. [DESIGN §4.1]
-			_ = e.client.Close()
+			// 채널만 닫는다. Channel.Close() 는 요청만 보내므로 원격이 응답하지 않으면 복사
+			// goroutine 이 남지만, 그것은 버린다(접속을 닫으면 이 머신 전체가 끊긴다). 죽은
+			// 접속은 keepalive 가 걷어낸다. [DESIGN §4.1, §10.1]
+			go func() { _ = ch.Close() }()
 			// outW 를 먼저 닫는다: 복사 고루틴이 (원격이 아니라) 우리 자신의 읽히지
 			// 않는 파이프에 막혀 있을 수 있고(호출자가 읽기를 멈춘 경우), 그건
 			// client.Close() 가 아니라 outW 를 닫아야 풀린다(io.Pipe 의 Write 는
@@ -472,9 +662,7 @@ func (e *sshExecutor) Stream(ctx context.Context, c Cmd) (io.ReadCloser, error) 
 			errVal := withStderr(fmt.Sprintf("executor/ssh: %s: %v 안에 출력이 다 오지 않았다", strings.Join(argv, " "), pipeDrainDelay),
 				errPipeDrainTimeout, stderr.String())
 			_ = outW.CloseWithError(errVal)
-			<-stdoutDone
-			<-stderrDone
-			<-stdinDone
+			waitAll(pipeDrainDelay, stdoutDone, stderrDone, stdinDone)
 			return
 		}
 		// ch 를 여기서 직접 닫지 않는다: fire-and-forget 으로 띄우면 close(s.done) 가
@@ -493,7 +681,7 @@ func (e *sshExecutor) Stream(ctx context.Context, c Cmd) (io.ReadCloser, error) 
 		}
 		_ = outW.Close()
 	}()
-	// ctx 취소도 Close 와 같은 효과를 낸다: 접속을 강제로 닫고 로컬 파이프도 닫는다
+	// ctx 취소도 Close 와 같은 효과를 낸다: 이 스트림의 채널과 로컬 파이프를 닫는다(접속은 유지)
 	// (그랜드차일드가 물고 있는 것과 무관하게, 읽는 쪽이 멈춘 경우도 마저 푼다).
 	// outW 를 (outR 가 아니라) CloseWithError 로 닫아야 마지막 Read 가 argv·stderr·
 	// ctx 오류를 받는다 — io.Pipe 는 reader 쪽 Close 가 아니라 writer 쪽
@@ -503,7 +691,8 @@ func (e *sshExecutor) Stream(ctx context.Context, c Cmd) (io.ReadCloser, error) 
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = e.client.Close()
+			// 스트림의 채널만 닫는다(접속 유지). 읽는 쪽은 outW 를 닫아 즉시 푼다. [DESIGN §4.1]
+			go func() { _ = ch.Close() }()
 			_ = outW.CloseWithError(withStderr(fmt.Sprintf("executor/ssh: %s", strings.Join(argv, " ")), ctx.Err(), stderr.String()))
 		case <-s.done:
 		}
@@ -511,14 +700,14 @@ func (e *sshExecutor) Stream(ctx context.Context, c Cmd) (io.ReadCloser, error) 
 	return s, nil
 }
 
-// Close 는 접속을 끊는다. 열려 있는 실행 채널(Run/Stream)은 각자 회수한다.
+// Close 는 접속을 끊는다. 열려 있는 실행 채널(Run/Stream)은 각자 회수한다. 여러 번 불러도 안전하다.
 func (e *sshExecutor) Close() error {
+	e.once.Do(func() { close(e.stop) })
 	return e.client.Close()
 }
 
 // sshStream 은 장기 스트림의 읽기 끝이다. 채널 수명을 함께 소유한다.
 type sshStream struct {
-	client    *ssh.Client
 	pr        *io.PipeReader
 	ch        ssh.Channel
 	done      chan struct{} // 채널 회수 완료
@@ -534,15 +723,14 @@ func (s *sshStream) Read(p []byte) (int, error) { return s.pr.Read(p) }
 // `ch.Write()`도 전송 계층·SSH 흐름 제어 윈도우가 막히면 무기한 걸릴 수 있다
 // (원격이 이미 죽었는데 그 사실을 모르는 경우 등). 그래서 이 셋(스트림 종료
 // s.done, close 요청, stdin 복사)을 상한(pipeDrainDelay) 하나로 함께 기다리고
-// (`waitAllOrClose`), 시간 안에 못 끝나면 접속 전체(Client.Close, 로컬 소켓만
-// 닫아 원격 응답 없이도 즉시 푼다)로 넘어가 나머지를 마저 회수한다. 정상적인
-// 경우(원격이 응답함)에는 접속을 유지해 이 머신의 다른 세션(Run 호출)에 영향이
-// 없다. 여러 번 불러도 안전하다.
+// (`waitAll`), 시간 안에 못 끝나면 남은 goroutine 을 버리고 반환한다 — 접속은
+// 어느 경우에도 닫지 않는다(그것은 이 머신의 다른 세션까지 끊는다). 죽은 접속은
+// keepalive 가 걷어낸다. 여러 번 불러도 안전하다. [DESIGN §4.1, §10.1]
 func (s *sshStream) Close() error {
 	_ = s.pr.Close()
 	closeReq := make(chan struct{})
 	go func() { _ = s.ch.Close(); close(closeReq) }()
-	waitAllOrClose(s.client, pipeDrainDelay, s.done, closeReq, s.stdinDone)
+	waitAll(pipeDrainDelay, s.done, closeReq, s.stdinDone)
 	return nil
 }
 

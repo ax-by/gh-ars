@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -14,8 +15,8 @@ import (
 
 // NewDocker 는 docker CLI 위의 Runtime 이다. sudo 는 §10.2 판단 규칙 결과이며 docker 는
 // 규칙 2 에 따라 항상 false 를 받는다(docker 그룹 멤버 또는 root). [DESIGN §4.2]
-func NewDocker(ex executor.Executor, sudo bool) Runtime {
-	return &cli{kind: domain.RuntimeDocker, bin: "docker", sudo: sudo, ex: ex, f: dockerFlavor{}}
+func NewDocker(ex executor.Executor, sudo bool, log *slog.Logger) Runtime {
+	return newCLI(domain.RuntimeDocker, "docker", ex, sudo, dockerFlavor{}, log)
 }
 
 type dockerFlavor struct{}
@@ -64,7 +65,9 @@ func (dockerFlavor) parseEvent(line []byte) (Event, bool, error) {
 		return Event{}, false, fmt.Errorf("runtime: docker event 파싱: %w", err)
 	}
 	if e.Type != "container" {
-		return Event{}, false, nil
+		// 구독 argv 에 `--filter type=container` 가 있다(cli.go). 그래도 다른 type 이 온다면
+		// 필터가 무시됐거나 스키마가 바뀐 것이므로 이상 신호로 센다.
+		return Event{}, false, fmt.Errorf("runtime: docker event type %q(container 아님): %s", e.Type, line)
 	}
 	name := e.Actor.Attributes["name"]
 	if name == "" {
@@ -98,6 +101,12 @@ func (dockerFlavor) parseInfo(out []byte) (Info, error) {
 	}
 	if len(i.ServerErrors) > 0 {
 		return Info{}, errors.New("runtime: docker info: " + strings.Join(i.ServerErrors, "; "))
+	}
+	if i.NCPU <= 0 || i.MemTotal <= 0 {
+		// 스키마가 어긋나 0 이 나가면 R21 이 physicalMax 0 으로 읽어 그 머신을 **영구 Failed**
+		// (재접속 대상에서도 제외)로 만든다. 예산을 못 얻은 info 는 쓸모가 없으므로 오류로
+		// 올려 unhealthy(재시도 가능)로 두는 편이 맞다. [§7.1-3, R21]
+		return Info{}, fmt.Errorf("runtime: docker info 에 예산이 없다(NCPU=%d, MemTotal=%d)", i.NCPU, i.MemTotal)
 	}
 	return Info{
 		CPUs:          float64(i.NCPU),

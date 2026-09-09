@@ -125,7 +125,7 @@ GetRunner(RunnerName) → (found) RemoveRunner → runner 컨테이너 rm → si
 
 ### 3.3 Machine health  [§7.1-3, §7.1-8, §10.1]
 
-- `Healthy` → `Unhealthy`: SSH 단절, events 스트림 종료, pre-pull 실패, `info` 실패. capacity에서 제외.
+- `Healthy` → `Unhealthy`: SSH 단절(keepalive 연속 실패 포함, §10.1), events 스트림 종료, pre-pull 실패, `info` 실패. capacity에서 제외. **명령 하나의 실패·타임아웃은 트리거가 아니다** — 그것은 그 unit의 정리·기동 재시도(§8.3)로 처리한다.
 - `Unhealthy` → `Healthy`: 백오프 재접속 성공 + 전체 동기화 완료.
 - `Failed`: preflight의 설정·환경 모순(R16, R21). 시작 시 발견되면 프로세스 시작 실패. 재접속 후 preflight에서 발견되면 그 머신만 `Failed`로 두고 오류 로그. `Failed`는 capacity와 배치에서 제외되고 **재접속 대상에서도 제외**된다(에이전트 goroutine 종료). [§7.1-3, R21]
 
@@ -197,7 +197,15 @@ func NewSSH(cfg SSHConfig) (Executor, error)   // 연결 유지, host key 검증
 
 `SSHConfig`: Host, Port, User, KeyFile, KeyPassphrase, Fingerprint, KnownHostsFile, InsecureSkipHostKeyVerify, Log(R20 경고용). 접속 타임아웃 10s는 설정이 아니라 코드 상수 `sshConnectTimeout`이다(§3.2: 상수의 설정 노출은 non-goal). 구현 라이브러리: `golang.org/x/crypto/ssh` + `knownhosts`.
 
-**host key 알고리즘 선호 순서를 직접 정한다.** x/crypto의 기본 순서는 ed25519를 마지막에 두어 서버가 ecdsa/rsa를 고르게 만드는데, 사용자가 기록해 둔 `known_hosts` 항목·`fingerprint`는 보통 OpenSSH가 협상한 ed25519다. 그대로 두면 `ssh user@host`가 되는 정상 호스트가 gh-ars에서만 host key 불일치로 거부된다(실측 2026-09-09). 그래서 OpenSSH와 같은 순서(ed25519 → ecdsa → rsa)를 `ClientConfig.HostKeyAlgorithms`에 넣고, `known_hosts`가 그 호스트에 대해 다른 타입만 가진 경우에는 검증 실패에 실려 오는 `knownhosts.KeyError.Want`의 키 타입들로 **같은 10s 예산 안에서 한 번 더** 시도한다(파일의 와일드카드·해시 항목 매칭은 라이브러리가 이미 하므로 우리가 다시 파싱하지 않는다). [§10.1, R20]
+**ctx 취소는 채널만 끝낸다.** 위 계약이 ctx 취소를 명령 단위의 정상적인 결과로 규정하므로(local은 프로세스만 죽인다) ssh 구현도 그 채널만 닫고 접속은 유지한다. 접속을 닫는 것은 keepalive 연속 실패(연결 수준 신호)와 명시적 `Close`뿐이다. 상한 안에 회수되지 않은 복사 goroutine은 **버린다**: 접속을 닫아 강제 회수하면 그 머신의 events 스트림과 동시 실행 중인 다른 명령까지 끊기고, 버려진 goroutine은 원격이 응답하거나 접속이 끝날 때(그 접속이 정말 죽었다면 keepalive가 걷어낸다) 사라진다. 버린 뒤에는 **그들이 쓰는 버퍼를 읽지 않는다** — `Run`의 stdout/stderr는 잠금 없는 `bytes.Buffer`라, 회수를 확인한 경우에만 오류 메시지에 stderr를 싣는다(`Stream`이 쓰는 `capBuffer`는 잠금이 있어 제약이 없다). [SPEC §10.1, §8.3]
+
+**keepalive.** 접속마다 `keepalive@openssh.com` 요청을 주기적으로 보내고, 연속 실패가 허용 미스(SPEC §8.3)에 닿으면 접속을 닫아 §10.1의 "단절 → unhealthy → 재접속" 경로로 보낸다. half-open 접속은 events가 조용하고 명령도 매달리기만 해서 다른 신호가 없다.
+
+프로브는 **응답을 동기로 기다리지 않는다**: `SendRequest(wantReply=true)`는 응답이 오거나 접속이 죽을 때까지 막히는데, half-open에서 그 시점은 TCP 스택이 포기할 때(Linux 기본 ≈15분)라 §8.3이 약속한 `주기 × 미스` 상한이 무너진다. 프로브는 goroutine으로 띄우고 **다음 주기까지 응답이 없으면 그 자체를 miss로 센다**(OpenSSH의 `ServerAliveInterval`/`ServerAliveCountMax`와 같은 의미론). 프로브는 한 번에 하나만 띄우고, 주기 직전에 도착한 결과는 먼저 반영한다(응답한 프로브를 "응답 없음"으로 세지 않도록). 판정부는 시간도 전송도 모르는 상태 기계(`keepaliveState`)로 분리해 표로 검증한다.
+
+**host key 알고리즘 선호 순서를 직접 정한다.** x/crypto의 기본 순서는 ed25519를 마지막에 두어 서버가 ecdsa/rsa를 고르게 만드는데, 사용자가 기록해 둔 `known_hosts` 항목·`fingerprint`는 보통 OpenSSH가 협상한 ed25519다. 그대로 두면 `ssh user@host`가 되는 정상 호스트가 gh-ars에서만 host key 불일치로 거부된다(실측 2026-09-09). 그래서 **라이브러리의 지원 목록(`ssh.SupportedAlgorithms().HostKeys`)을 OpenSSH 순서(ed25519 → ecdsa → rsa)로 재정렬해** `ClientConfig.HostKeyAlgorithms`에 넣는다. 목록을 손으로 쓰지 않는 이유는 두 가지다: 인증서 알고리즘이 빠지면 `@cert-authority` 항목만 있는 호스트에 접속하지 못하고, 라이브러리가 보안 문제로 제외한 `ssh-rsa`(SHA-1)를 되살리게 된다.
+
+재시도는 검증 방식마다 다르다. `known_hosts`는 그 호스트에 대해 다른 타입만 가진 경우 검증 실패에 `knownhosts.KeyError.Want`가 실려 오므로, 그 키들의 **계열**에 해당하는 지원 알고리즘으로 한 번 더 시도한다(파일의 와일드카드·해시 항목 매칭은 라이브러리가 이미 하므로 우리가 다시 파싱하지 않는다). `fingerprint`는 어떤 계열의 키를 기록해 둔 것인지 알 방법이 없으므로 **계열을 차례로**(ed25519 → ecdsa → rsa) 시도하고, 다 어긋나면 R20대로 거부한다 — 한 번만 재시도하면 지문이 3순위 키로 기록된 머신이 영구히 접속하지 못한다. 모든 시도는 같은 10s 예산을 공유한다. [§10.1, R20]
 
 ### 4.2 Runtime  [§5, §7, §9]
 
@@ -254,11 +262,11 @@ type Runtime interface {
     Events(ctx, labelFilter string) (<-chan Event, <-chan error)  // 스트림 종료 시 error 채널로 통지
 }
 
-func NewDocker(ex executor.Executor, sudo bool) Runtime   // sudo 는 §10.2 판단 규칙 결과 (docker 는 항상 false)
-func NewPodman(ex executor.Executor, sudo bool) Runtime
+func NewDocker(ex executor.Executor, sudo bool, log *slog.Logger) Runtime   // sudo 는 §10.2 판단 규칙 결과 (docker 는 항상 false)
+func NewPodman(ex executor.Executor, sudo bool, log *slog.Logger) Runtime
 ```
 
-docker/podman 구현은 argv 조립과 출력 파싱만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`. `info`는 두 runtime 모두 `--format '{{json .}}'`를 파싱한다. `events`는 docker만 `--format '{{json .}}'`를 쓰고, podman은 `--format json`(SPEC §5 명시)이다 — 둘 다 결과는 JSON Lines 한 줄씩이지만 podman의 이벤트 스키마 자체가 docker와 다르다(`flavor.eventsFormat()`으로 분기). podman의 시각 필드는 버전에 따라 유닉스 정수(`time`, `timeNano`)로도 RFC3339 문자열(`Time`)로도 오므로 양쪽을 모두 받는다 — 정수를 `time.Time`으로 받으려다 unmarshal이 실패하면 그 줄이 통째로 버려지고, 그러면 **모든** 이벤트가 사라져 `die`가 영영 오지 않는다(실측 podman 6.1.1, 2026-09-09). 같은 이유로 `flavor.parseEvent`는 "관심 없는 줄"과 "읽지 못한 줄"을 구분하고, `Events`는 읽지 못한 줄 수를 세어 스트림 종료 오류에 실어 보낸다: 스키마가 통째로 어긋난 상태와 "조용한 정상"이 구분되지 않으면 진단할 방법이 없다. `ps`는 `{{json .}}`를 쓰지 않는다: 그 출력의 `Labels`는 "k=v,k=v"를 이스케이프 없이 이어붙인 문자열이라 이미지가 물려준 라벨 값에 `,gh-ars.mode=none` 같은 조각이 있으면 실제 라벨을 덮어쓸 수 있다. 대신 `{{.Names}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label "gh-ars.unit"}}…` 처럼 §4.2의 gh-ars.* 키 5개를 하나씩 뽑는 탭 구분 템플릿을 쓰고, `Container.Labels`에는 그 키만 담는다(입양 복원에 그것만 필요하다). 비0 종료는 `*ExitError{Argv, ExitCode, Stderr}`로 올리고, `Remove`/`VolumeRemove`는 "이미 없음" 응답을 성공으로 흡수한다(§8.3 멱등).
+docker/podman 구현은 argv 조립과 출력 파싱만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`. `info`는 두 runtime 모두 `--format '{{json .}}'`를 파싱한다. `events`는 docker만 `--format '{{json .}}'`를 쓰고, podman은 `--format json`(SPEC §5 명시)이다 — 둘 다 결과는 JSON Lines 한 줄씩이지만 podman의 이벤트 스키마 자체가 docker와 다르다(`flavor.eventsFormat()`으로 분기). podman의 시각 필드는 버전에 따라 유닉스 정수(`time`, `timeNano`)로도 RFC3339 문자열(`Time`)로도 오므로 양쪽을 모두 받는다 — 정수를 `time.Time`으로 받으려다 unmarshal이 실패하면 그 줄이 통째로 버려지고, 그러면 **모든** 이벤트가 사라져 `die`가 영영 오지 않는다(실측 podman 6.1.1, 2026-09-09). 같은 이유로 `flavor.parseEvent`는 "관심 없는 줄"과 "읽지 못한 줄"을 구분한다. 구독 argv에 `--filter type=container`가 있으므로 다른 type이나 이름 없는 줄이 오는 것도 스키마 어긋남으로 센다. **첫 읽지 못한 줄은 즉시 `Warn`으로 남기고 스트림은 유지한다**(이후는 종료 오류에 싣는 집계로 갈음): 스키마가 통째로 어긋나면 스트림은 정상적으로 열린 채 며칠씩 유지되고 모든 줄이 조용히 버려지는데, 종료 오류만으로는 그 신호가 영영 나오지 않는다(§7.1-8의 재시작 트리거가 오지 않는다). 중간 통지를 `errCh`로 보내지는 않는다 — machine 층이 그것을 회차 종료로 읽는다. 그래서 `NewDocker`/`NewPodman`은 로거를 받는다(nil이면 `slog.Default()`). `ps`는 `{{json .}}`를 쓰지 않는다: 그 출력의 `Labels`는 "k=v,k=v"를 이스케이프 없이 이어붙인 문자열이라 이미지가 물려준 라벨 값에 `,gh-ars.mode=none` 같은 조각이 있으면 실제 라벨을 덮어쓸 수 있다. 대신 `{{.Names}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label "gh-ars.unit"}}…` 처럼 §4.2의 gh-ars.* 키 5개를 하나씩 뽑는 탭 구분 템플릿을 쓰고, `Container.Labels`에는 그 키만 담는다(입양 복원에 그것만 필요하다). 비0 종료는 `*ExitError{Argv, ExitCode, Stderr}`로 올리고, `Remove`/`VolumeRemove`는 "이미 없음" 응답을 성공으로 흡수한다(§8.3 멱등).
 
 **sidecar 컨테이너 CreateSpec 값** [§9.1]:
 
@@ -481,7 +489,7 @@ preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 
 시작 시와 재접속 시의 차이: 시작 시 R16/R21 오류는 프로세스 시작 실패. 재접속 후 preflight에서 같은 오류가 나면 `msgHealth{Failed}`를 보내고 에이전트 goroutine을 종료한다(재접속 없음). R24는 Controller가 시작 시 한 번 평가한다: 전 머신 도달이면 위반 시 시작 실패, 미도달 머신이 있으면 경고. [§6.2 R21, R24]
 
-`NewDocker/NewPodman(ex, sudo)`와 `systemd.New(ex, sudo)`의 `sudo`는 위 2·3·4단계 결과에서 나온다(docker: 항상 false, podman: 3단계 결과, systemd: `!root`).
+`NewDocker/NewPodman(ex, sudo, log)`와 `systemd.New(ex, sudo)`의 `sudo`는 위 2·3·4단계 결과에서 나온다(docker: 항상 false, podman: 3단계 결과, systemd: `!root`).
 
 5단계의 예산 판정(R21)만은 설정 값을 아는 Controller가 `Spec.Verify(info) error`로 넘긴다(machine은 config에 의존하지 않는다, §2). 에이전트는 이 오류를 R16과 같은 등급(`ErrFatal`)으로 다뤄 시작 시에는 그대로 올리고 재접속 후에는 `Failed`로 만든다. 접속 재료도 같은 이유로 `machine.SSH`(config.SSH의 값 복사)로 받는다.
 

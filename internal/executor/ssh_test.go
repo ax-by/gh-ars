@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"log/slog"
 	"net"
@@ -28,6 +29,20 @@ func genKey(t *testing.T) ssh.PublicKey {
 		t.Fatalf("ssh.NewPublicKey: %v", err)
 	}
 	return sshPub
+}
+
+// genRSAKey 는 테스트용 RSA host key 다(2048비트: 생성 비용과 현실성의 절충).
+func genRSAKey(t *testing.T) ssh.PublicKey {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	pub, err := ssh.NewPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatalf("ssh.NewPublicKey: %v", err)
+	}
+	return pub
 }
 
 func dummyAddr(t *testing.T) net.Addr {
@@ -126,37 +141,97 @@ func TestSSHHostKeyCallback_R20_InsecureOverridesOthers(t *testing.T) {
 	}
 }
 
-// TestSSH_R20_HostKeyPreferenceEd25519First: host key 알고리즘 선호 순서는 OpenSSH 와 같아야 한다.
-// x/crypto 의 기본 순서는 ed25519 를 마지막에 두어 서버가 ecdsa/rsa 를 고르게 만드는데, 사용자가
-// 기록해 둔 known_hosts 항목·fingerprint 는 보통 OpenSSH 가 협상한 ed25519 다. 순서를 맞추지
-// 않으면 `ssh user@host` 는 되는 정상 호스트가 "knownhosts: key mismatch" 로 거부된다
-// (실측 2026-09-09, macOS sshd: ed25519 항목만 있는 known_hosts 로 접속 실패). [§10.1, R20]
-func TestSSH_R20_HostKeyPreferenceEd25519First(t *testing.T) {
-	if len(hostKeyPreference) == 0 || hostKeyPreference[0] != ssh.KeyAlgoED25519 {
-		t.Fatalf("선호 순서 = %v, want ed25519 우선", hostKeyPreference)
+// TestSSH_R20_FingerprintMismatchIsRetryable: fingerprint 불일치는 재시도 판단이 가능한
+// 오류여야 한다. 선호 순서를 ed25519 우선으로 고정했으므로, ecdsa/rsa 키의 지문을 기록해 둔
+// 머신은 첫 협상에서 반드시 불일치가 난다 — 그때 나머지 타입으로 한 번 더 시도하지 않으면
+// 그 머신은 영구히 접속하지 못한다(이 선호 순서 도입 전에는 되던 구성이다). [§10.1, R20]
+func TestSSH_R20_FingerprintMismatchIsRetryable(t *testing.T) {
+	cb, err := sshHostKeyCallback(SSHConfig{Fingerprint: "SHA256:다른키지문"}, slog.Default())
+	if err != nil {
+		t.Fatalf("callback: %v", err)
 	}
-	for _, want := range []string{ssh.KeyAlgoECDSA256, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA} {
-		found := false
-		for _, got := range hostKeyPreference {
-			if got == want {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("%s 가 빠져 그 타입만 가진 호스트에 접속할 수 없다: %v", want, hostKeyPreference)
+	err = cb("host", dummyAddr(t), genKey(t))
+	if err == nil {
+		t.Fatal("지문이 다른데 통과했다")
+	}
+	if !errors.Is(err, errFingerprintMismatch) {
+		t.Fatalf("err = %v, want errFingerprintMismatch (재시도 판단 불가)", err)
+	}
+	// 재시도는 계열 단위로 넘어간다: 첫 계열(ed25519)이 안 맞으면 ecdsa, 그 다음 rsa 를 본다.
+	// 계열이 하나뿐이면 지문이 3순위 키로 기록된 머신이 영구히 접속하지 못한다.
+	if len(hostKeyFamilies) < 3 {
+		t.Fatalf("계열 묶음 %d개, want 3 (ed25519·ecdsa·rsa)", len(hostKeyFamilies))
+	}
+	for i, fam := range hostKeyFamilies {
+		if len(fam) == 0 || hostKeyFamily(fam[0]) != i {
+			t.Fatalf("계열 %d 이 순서대로가 아니다: %v", i, fam)
 		}
 	}
 }
 
-// TestSSH_R20_KnownKeyTypes: known_hosts 가 그 호스트에 대해 가진 키 타입만, 중복 없이, 파일
-// 순서대로 뽑는다. 이 목록이 "key mismatch" 재시도의 HostKeyAlgorithms 가 된다. [§10.1, R20]
+// TestSSH_R20_KnownKeyTypes: known_hosts 가 가진 키의 **계열**로 재시도 목록을 만든다.
+// 목록은 라이브러리 지원 목록에서 고른다: 손으로 쓰면 인증서 알고리즘이 빠지거나(`@cert-authority`
+// 호스트 접속 불가) 보안 문제로 제외된 `ssh-rsa`(SHA-1)를 되살린다. [§10.1, R20]
 func TestSSH_R20_KnownKeyTypes(t *testing.T) {
-	k1, k2 := genKey(t), genKey(t)
-	got := knownKeyTypes([]knownhosts.KnownKey{{Key: k1}, {Key: k2}, {Key: nil}})
-	if len(got) != 1 || got[0] != ssh.KeyAlgoED25519 {
-		t.Fatalf("knownKeyTypes = %v, want [%s] (같은 타입은 한 번, nil 은 무시)", got, ssh.KeyAlgoED25519)
+	supported := map[string]bool{}
+	for _, a := range ssh.SupportedAlgorithms().HostKeys {
+		supported[a] = true
+	}
+
+	for _, tc := range []struct {
+		name   string
+		key    ssh.PublicKey
+		family int
+	}{
+		{"ed25519", genKey(t), 0},
+		{"rsa", genRSAKey(t), 2},
+	} {
+		got := knownKeyTypes([]knownhosts.KnownKey{{Key: tc.key}, {Key: tc.key}, {Key: nil}})
+		if len(got) == 0 {
+			t.Fatalf("%s: 재시도 목록이 비었다", tc.name)
+		}
+		seen := map[string]bool{}
+		for _, algo := range got {
+			if !supported[algo] {
+				t.Fatalf("%s: 지원하지 않는 알고리즘 %q (ssh-rsa 같은 것을 되살리면 안 된다)", tc.name, algo)
+			}
+			if hostKeyFamily(algo) != tc.family {
+				t.Fatalf("%s: 다른 계열 %q 가 섞였다", tc.name, algo)
+			}
+			if seen[algo] {
+				t.Fatalf("%s: 중복 %q", tc.name, algo)
+			}
+			seen[algo] = true
+		}
+		if tc.family == 2 && seen[ssh.KeyAlgoRSA] {
+			t.Fatal("SHA-1 서명(ssh-rsa)을 제시했다")
+		}
 	}
 	if len(knownKeyTypes(nil)) != 0 {
 		t.Fatal("항목이 없으면 빈 목록이어야 한다(그래야 기본 선호 순서를 그대로 쓴다)")
+	}
+}
+
+// TestSSH_R20_HostKeyPreferenceCoversLibrary: 선호 목록은 라이브러리 지원 목록의 재정렬이어야
+// 한다(빠지거나 더해지면 인증서 호스트 접속 불가·SHA-1 부활로 이어진다). ed25519 가 먼저다.
+func TestSSH_R20_HostKeyPreferenceCoversLibrary(t *testing.T) {
+	lib := ssh.SupportedAlgorithms().HostKeys
+	if len(hostKeyPreference) != len(lib) {
+		t.Fatalf("선호 목록 %d개, 라이브러리 %d개 — 재정렬이 아니라 다른 목록이다", len(hostKeyPreference), len(lib))
+	}
+	inLib := map[string]bool{}
+	for _, a := range lib {
+		inLib[a] = true
+	}
+	for _, a := range hostKeyPreference {
+		if !inLib[a] {
+			t.Fatalf("라이브러리에 없는 알고리즘 %q", a)
+		}
+	}
+	if hostKeyFamily(hostKeyPreference[0]) != 0 {
+		t.Fatalf("첫 알고리즘 %q 가 ed25519 계열이 아니다", hostKeyPreference[0])
+	}
+	if len(hostKeyFamilies) < 2 {
+		t.Fatalf("계열 묶음 %d개 — fingerprint 재시도가 성립하지 않는다", len(hostKeyFamilies))
 	}
 }

@@ -15,7 +15,7 @@ import (
 func newDockerFake(t *testing.T) (*fakeExec, Runtime) {
 	t.Helper()
 	f := &fakeExec{t: t}
-	return f, NewDocker(f, false)
+	return f, NewDocker(f, false, testLogger())
 }
 
 // [DESIGN §4.2] docker 구현의 Kind 와 sudo. docker 는 §10.2 규칙 2 에 따라 sudo 를 쓰지 않는다.
@@ -335,6 +335,12 @@ func TestDocker_S9_2_InfoParse(t *testing.T) {
 	if _, err := rt.Info(context.Background()); err == nil {
 		t.Fatal("비0 종료가 오류가 아니다")
 	}
+	// 예산이 없는 info(스키마 어긋남)는 조용한 0 이 아니라 오류다: 0 은 R21 에서 physicalMax 0 →
+	// 영구 Failed 로 번지는데, 원인은 스키마 불일치이므로 재시도 가능한 unhealthy 여야 한다. [§7.1-3, R21]
+	f.results = []executor.Result{{Stdout: []byte(`{"CgroupDriver":"systemd","CgroupVersion":"2"}`)}}
+	if _, err := rt.Info(context.Background()); err == nil {
+		t.Fatal("NCPU·MemTotal 이 없는 info 가 성공으로 처리됐다")
+	}
 }
 
 // [§7.1-8, §4.2] events: 라벨·type 필터를 건 `{{json .}}` 스트림을 {Name, Action, ExitCode, At} 로
@@ -451,8 +457,9 @@ func TestDocker_S4_2_EventWithoutNameIsUnparseable(t *testing.T) {
 	if ok || err == nil {
 		t.Fatalf("ok=%v err=%v, want 읽지 못한 줄", ok, err)
 	}
+	// 구독이 type=container 로 좁혀져 있으므로 다른 type 이 오는 것도 이상 신호다.
 	_, ok, err = dockerFlavor{}.parseEvent([]byte(`{"Type":"network","Action":"connect","Actor":{"Attributes":{}}}`))
-	if ok || err != nil {
-		t.Fatalf("ok=%v err=%v, want 관심 없는 줄(오류 아님)", ok, err)
+	if ok || err == nil {
+		t.Fatalf("ok=%v err=%v, want 읽지 못한 줄", ok, err)
 	}
 }

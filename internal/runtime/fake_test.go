@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -70,3 +71,8 @@ func (f *fakeExec) last() executor.Cmd {
 }
 
 var errBoom = errors.New("boom")
+
+// testLogger 는 테스트에서 로그를 버린다(경고 경로가 nil 로거로 깨지지 않는지도 함께 본다).
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}

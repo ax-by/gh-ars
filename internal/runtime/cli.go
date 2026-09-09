@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -117,6 +118,14 @@ type cli struct {
 	sudo bool // §10.2 판단 규칙 결과. 모든 명령에 그대로 전파한다
 	ex   executor.Executor
 	f    flavor
+	log  *slog.Logger
+}
+
+func newCLI(kind domain.RuntimeKind, bin string, ex executor.Executor, sudo bool, f flavor, log *slog.Logger) Runtime {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &cli{kind: kind, bin: bin, sudo: sudo, ex: ex, f: f, log: log}
 }
 
 // jsonFormat 은 events/info 출력 형식이다. ps 는 flavor.psFormat 을 쓴다. [DESIGN §4.2]
@@ -315,6 +324,14 @@ func (c *cli) Events(ctx context.Context, labelFilter string) (<-chan Event, <-c
 			if perr != nil {
 				bad++
 				lastBad = perr
+				if bad == 1 {
+					// 첫 줄은 즉시 알린다. 스키마가 통째로 어긋나면 스트림은 정상적으로 열린 채
+					// 며칠씩 유지되고 모든 줄이 버려지는데, 종료 오류만으로는 그 신호가 영영
+					// 나오지 않는다(§7.1-8 의 재시작 트리거가 오지 않는다). 이후는 종료 오류의
+					// 집계로 갈음한다. [DESIGN §4.2]
+					c.log.Warn("runtime: events 줄을 읽지 못했다(스키마 불일치일 수 있다)",
+						"runtime", c.kind, "err", perr)
+				}
 				continue
 			}
 			if !ok {
