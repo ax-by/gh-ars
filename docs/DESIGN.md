@@ -410,7 +410,7 @@ type Controller struct {
 type (
     msgDesired      struct{ ScaleSet string; Assigned int; Reply chan int }   // listener 콜백
     msgEvent        struct{ Machine string; Ev runtime.Event }
-    msgHealth       struct{ Machine string; Healthy bool }
+    msgHealth       struct{ Machine string; Health domain.Health; Err error } // Unhealthy(재접속 대상) | Failed(§3.3, 재접속 없음)
     msgResynced     struct{ Machine string; Obs plan.Observed }
     msgTick         struct{}                                   // 30s 코드 상수 [§8.3 상수 표]
     msgUnitStarted  struct{ Unit UnitID; Err error }           // 비동기 create→cp→start 완료
@@ -437,7 +437,7 @@ Controller가 머신에 요구하는 것은 `MachineAgent` 인터페이스(`Name
 | `msgJobCompleted` | RunnerName(비면 RunnerID)으로 unit을 찾는다. 살아 있으면 `Completed=true`. 없거나 이미 `Dying`/제거됐으면 그 scale set의 `pendingCompletion`에서 이름을 뺀다(없으면 무시). [§7.2-3] |
 | `msgEvent` (`die`, role=runner) | unit(Creating/Starting/Running/Draining 모두)을 `markDying`으로 `Dying`으로 → goroutine `cleanupUnit`. `markDying`은 Dying 전이의 유일한 경로이며 `Busy && !Completed`면 RunnerName을 `pendingCompletion`에 넣는다(등록 시각·머신·RunnerID 기록) — tick 미등록 판정 등 다른 경로로 죽어도 같은 보정을 받는다. 그 뒤 `minRunners` 미달분만 보충하고 **assigned 기반 신규 생성은 하지 않는다**(§7.2-3 식의 귀결). 이미 `Dying`/정리된 unit의 die는 무시. [§7.2-3, §7.2-5] |
 | `msgEvent` (`die`, role=sidecar) | runner가 살아 있으면 로그만(runner die 시 함께 정리). |
-| `msgHealth` | 머신 health 갱신 → capacity 재계산 → `SetMaxRunners`. unhealthy 머신의 Dying unit은 정리를 보류한다. |
+| `msgHealth` | 머신 health 갱신 → capacity 재계산 → `SetMaxRunners`. unhealthy 머신의 Dying unit은 정리를 보류한다. `Failed`(재접속 preflight의 R16/R21 위반)는 되돌리지 않는다: 이후의 health·재동기화 메시지로도 healthy로 복귀하지 않는다(§3.3). |
 | `msgResynced` | **부품은 스냅샷이 권위다.** `plan.Reconcile` 실행 **전에** 이 머신 소속 known unit의 `Parts`를 `Obs`가 보여준 부품 집합으로 덮어쓴다(정리 실패나 외부 rm으로 캐시가 어긋나면 §8.3의 slot 점유 계산이 틀어진다). `State`는 유지한다 — 상태 판정에는 GitHub 등록 대조가 필요해 `Reconcile`이 판정하지 않는다(§5 책임 경계). `Busy`도 유지한다 — 출처가 머신 이벤트가 아니라 메시지 세션(`msgJobStarted`)이라 SSH 단절로 낡지 않고, 되채우는 경로가 없어 리셋하면 남은 생애 동안 `false`로 고정된다. 그 다음 `Reconcile` 결과의 Adopt/RemoveUnit/RemoveOrphan을 적용한다(보류된 Dying 포함). RemoveOrphan은 unit id별로 모아 **runner 이름 없는 Dying unit**으로 등록한다(`Mode=sidecar`, `Foreign`, 관측된 Parts): `cleanupUnit`의 GitHub 단계만 건너뛰고 sidecar → 볼륨 → slice 순서, tick 재시도, slot 점유를 그대로 탄다(고아 등록은 GitHub이 자동 제거, §3.2). 관측 시각(`At`) 이후 `Starting`이 된 unit은 Creating 예외(§5). 부품 집합만 판정하고 GitHub은 조회하지 않는다. 이 머신 소속 `pendingCompletion` 항목을 비운다(§7.2-3 안전장치). 머신 healthy 복귀. |
 | `msgTick` | **GitHub 등록 대조의 유일한 구현 주체.** Starting/Running unit(**Draining 제외**, 대조가 진행 중이 아닌 것)을 모아 goroutine이 `GetRunner`를 부르고 결과를 `msgRegistration`으로 돌려보낸다(루프 안에서 GitHub을 부르지 않는다). `Creating`의 기동 타임아웃 판정. healthy 머신의 `Dying` unit 중 정리가 진행 중이 아닌 것은 `cleanupUnit` 재시도. `pendingCompletion`·`completedIDs`에서 5분 지난 항목 제거(§7.2-3 안전장치, §8.3 상수 표). [§8.3] |
 | `msgRegistration` | `Found`면 `learnRunnerID`(§4.5). Starting: 등록되면 `Running`, 미등록이고 grace 초과면 `Dying`, 이내면 대기. Running: 미등록이면 grace 없이 `Dying`. 오류는 로그만(다음 tick 재시도). unit이 그 사이 다른 상태가 됐으면 무시. [§8.3] |
@@ -472,6 +472,8 @@ preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 시작 시와 재접속 시의 차이: 시작 시 R16/R21 오류는 프로세스 시작 실패. 재접속 후 preflight에서 같은 오류가 나면 `msgHealth{Failed}`를 보내고 에이전트 goroutine을 종료한다(재접속 없음). R24는 Controller가 시작 시 한 번 평가한다: 전 머신 도달이면 위반 시 시작 실패, 미도달 머신이 있으면 경고. [§6.2 R21, R24]
 
 `NewDocker/NewPodman(ex, sudo)`와 `systemd.New(ex, sudo)`의 `sudo`는 위 2·3·4단계 결과에서 나온다(docker: 항상 false, podman: 3단계 결과, systemd: `!root`).
+
+5단계의 예산 판정(R21)만은 설정 값을 아는 Controller가 `Spec.Verify(info) error`로 넘긴다(machine은 config에 의존하지 않는다, §2). 에이전트는 이 오류를 R16과 같은 등급(`ErrFatal`)으로 다뤄 시작 시에는 그대로 올리고 재접속 후에는 `Failed`로 만든다. 접속 재료도 같은 이유로 `machine.SSH`(config.SSH의 값 복사)로 받는다.
 
 백오프: 1s 시작, ×2, 최대 30s, ±20% jitter, 성공 시 리셋. local 머신은 events 재시작에만 적용. [§7.1-8]
 

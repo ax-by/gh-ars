@@ -22,13 +22,17 @@ type (
 	}
 	msgHealth struct { // 머신 health 변화. Healthy 복귀는 msgResynced 가 맡는다 [§7.1-8]
 		Machine string
-		Healthy bool
-		Err     error
+		// Health 는 Unhealthy(재접속 대상) 또는 Failed(설정·환경 모순, 재접속 없음)다. [DESIGN §3.3]
+		Health domain.Health
+		Err    error
 	}
 	msgResynced struct { // 전체 동기화 스냅샷 [§7.1-7, §8.3]
 		Machine string
 		At      time.Time // 관측 시각(0 이면 판정 시각으로 본다)
-		Obs     plan.Observed
+		// Info 는 그 회차의 runtime info 다. 재접속으로 healthy 가 되는 머신의 예산·physicalMax·
+		// effectiveMax 를 여기서 다시 계산한다(시작 시 미도달이었으면 그때까지 0 이다). [§7.1-3, R21, R22]
+		Info runtime.Info
+		Obs  plan.Observed
 	}
 	msgTick        struct{} // 30s [§8.3 상수 표]
 	msgUnitStarted struct { // 비동기 create→cp→start 완료 [§7.2-4]
@@ -124,6 +128,13 @@ func (c *Controller) handleDesired(name string, totalAssigned int) int {
 // createUnits 는 spread 로 머신을 고르고 Creating unit 을 등록한 뒤 startUnit goroutine 을 띄운다.
 // 후보 머신이 없으면 pending 으로 남긴다(job 은 GitHub 큐에서 대기). [§7.2-3, §8.2]
 func (c *Controller) createUnits(ss *scaleSetState, n int) {
+	if c.syncing {
+		// 전체 동기화가 끝나기 전에는 배치하지 않는다: 아직 입양하지 못한 머신의 slot 점유를 모른 채
+		// spread 를 돌리면 §8.2 의 여유 슬롯 판단이 틀린다(이 구간에 오는 것은 다른 머신의 die 가
+		// 부르는 minRunners 보충뿐이며, 세션이 열린 뒤 첫 desired 계산이 그대로 메운다). [§7.1-7 → §7.1-9]
+		c.log.Debug("initial sync in progress, deferring unit creation", "scaleSet", ss.Name, "n", n)
+		return
+	}
 	for i := 0; i < n; i++ {
 		now := c.opts.Now()
 		mname, ok := plan.Spread(c.machinesOf(ss.Name), plan.Occupied(c.unitList()), now)
@@ -210,15 +221,20 @@ func (c *Controller) startCleanup(u *domain.Unit) {
 	c.spawn(func() { c.cleanupUnit(snapshot, agent.Runtime()) })
 }
 
-// handleHealth 는 머신 health 를 갱신하고 capacity 를 다시 계산한다. [§7.1-8, §10.1]
+// handleHealth 는 머신 health 를 갱신하고 capacity 를 다시 계산한다.
+// Failed 는 되돌리지 않는다: 그 머신은 배치·capacity 와 재접속 대상에서 영구 제외다. [§7.1-8, §10.1, DESIGN §3.3, R21]
 func (c *Controller) handleHealth(m msgHealth) {
 	mc := c.machineByName(m.Machine)
-	if mc == nil {
+	if mc == nil || mc.Health == domain.Failed {
 		return
 	}
-	if m.Healthy {
+	switch m.Health {
+	case domain.Healthy:
 		mc.Health = domain.Healthy
-	} else {
+	case domain.Failed:
+		c.log.Error("machine failed, excluded permanently", "machine", m.Machine, "err", m.Err)
+		mc.Health = domain.Failed
+	default:
 		if mc.Health == domain.Healthy {
 			c.log.Warn("machine unhealthy", "machine", m.Machine, "err", m.Err)
 		}
@@ -258,7 +274,18 @@ func (c *Controller) handleResynced(m msgResynced) {
 		cfg.KnownScaleSets[name] = ss.Mode
 	}
 	mc := c.machineByName(m.Machine)
-	if mc != nil {
+	if mc != nil && mc.Health != domain.Failed { // Failed 머신은 복귀하지 않는다 [DESIGN §3.3]
+		// 예산 재계산이 먼저다: 시작 시 미도달이었던 머신은 physicalMax·effectiveMax 가 0 이라
+		// healthy 로만 돌려놓으면 capacity 에 한 칸도 보태지 못하고 배치에서도 계속 빠진다.
+		// 여기서 드러난 R21 위반은 §7.1-3 대로 그 머신만 Failed 로 만든다. [§7.1-3, §8.1, R21, R22]
+		if m.Info.CPUs > 0 && m.Info.MemoryBytes > 0 { // info 를 담은 회차의 스냅샷만
+			if err := c.applyInfo(mc, m.Info); err != nil {
+				c.log.Error("machine failed, excluded permanently", "machine", m.Machine, "err", err)
+				mc.Health = domain.Failed
+				c.recomputeAll()
+				return
+			}
+		}
 		if mc.Health != domain.Healthy {
 			c.log.Info("machine healthy", "machine", m.Machine)
 		}

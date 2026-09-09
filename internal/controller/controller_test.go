@@ -90,7 +90,7 @@ func TestDesired_S7_2_3_CreateToStarting(t *testing.T) {
 // TestDesired_S7_2_1_CapacityFollowsHealth: 머신 unhealthy → capacity 0 → SetMaxRunners(0), 생성 없음(pending). [§7.2-1, §8.1]
 func TestDesired_S7_2_1_CapacityFollowsHealth(t *testing.T) {
 	h := newHarness(t, 0)
-	h.c.handle(msgHealth{Machine: testMachine, Healthy: false, Err: errors.New("events closed")})
+	h.c.handle(msgHealth{Machine: testMachine, Health: domain.Unhealthy, Err: errors.New("events closed")})
 	if got := h.max.last(); got != 0 {
 		t.Fatalf("SetMaxRunners %d, want 0", got)
 	}
@@ -101,6 +101,69 @@ func TestDesired_S7_2_1_CapacityFollowsHealth(t *testing.T) {
 	h.c.handle(msgResynced{Machine: testMachine, Obs: h.c.observed(testMachine, machine.Snapshot{})})
 	if got := h.max.last(); got != 4 {
 		t.Fatalf("SetMaxRunners %d, want 4", got)
+	}
+}
+
+// TestResynced_S7_1_3_ReconnectAppliesBudget: 시작 시 미도달이라 예산이 0 이던 머신은 재접속만으로는
+// 배치되지 못한다. 그 회차의 info 로 physicalMax·effectiveMax 를 다시 계산해야 capacity 에 든다.
+// 재계산에서 R21 위반이 드러나면 그 머신만 Failed 다(재접속 대상 제외). [§7.1-3, §8.1, R21, R22]
+func TestResynced_S7_1_3_ReconnectAppliesBudget(t *testing.T) {
+	h := newHarness(t, 0)
+	m := h.c.machineByName(testMachine)
+	m.Health, m.PhysicalMax, m.EffectiveMax = domain.Unhealthy, 0, 0 // 시작 시 preflight 미도달
+	delete(h.c.reached, testMachine)
+	h.c.recomputeAll()
+	if got := h.max.last(); got != 0 {
+		t.Fatalf("SetMaxRunners %d, want 0", got)
+	}
+
+	resync := func(info runtime.Info) {
+		h.c.handle(msgResynced{Machine: testMachine, Info: info, Obs: h.c.observed(testMachine, machine.Snapshot{})})
+	}
+	resync(runtime.Info{CPUs: 4, MemoryBytes: 4 << 30}) // unit 예산 1cpu/1Gi → physicalMax 4
+	if m.Health != domain.Healthy || m.PhysicalMax != 4 || m.EffectiveMax != 4 {
+		t.Fatalf("machine %+v, want Healthy 4/4", *m)
+	}
+	if got := h.max.last(); got != 4 {
+		t.Fatalf("SetMaxRunners %d, want 4", got)
+	}
+	if got := h.desired(1); got != 1 || len(h.c.units) != 1 {
+		t.Fatalf("desired=%d units=%d, want 1/1 (복귀한 머신에 배치돼야 한다)", got, len(h.c.units))
+	}
+	h.pumpUntil(isUnitStarted)
+
+	// 재접속 후 예산이 unit 예산보다 작으면 R21 위반 → Failed. 이후 재동기화로도 복귀하지 않는다.
+	resync(runtime.Info{CPUs: 0.5, MemoryBytes: 512 << 20})
+	if m.Health != domain.Failed {
+		t.Fatalf("health %s, want Failed", m.Health)
+	}
+	if got := h.max.last(); got != 0 {
+		t.Fatalf("SetMaxRunners %d, want 0 (Failed 는 capacity 에서 빠진다)", got)
+	}
+	resync(runtime.Info{CPUs: 4, MemoryBytes: 4 << 30})
+	if m.Health != domain.Failed {
+		t.Fatalf("Failed 가 되돌려졌다: %s", m.Health)
+	}
+}
+
+// TestSync_S7_1_7_NoPlacementBeforeInitialSync: 전체 동기화가 끝나기 전에는 unit 을 만들지 않는다.
+// 아직 입양하지 못한 머신의 slot 점유를 모르는 상태에서 배치하면 §8.2 의 여유 슬롯 판단이 틀린다.
+// 보충은 세션이 열린 뒤 첫 desired 계산이 한다. [§7.1-7 → §7.1-9, §8.2]
+func TestSync_S7_1_7_NoPlacementBeforeInitialSync(t *testing.T) {
+	h := newHarness(t, 1) // minRunners=1
+	u := h.addUnit(domain.StateRunning)
+	h.c.syncing = true
+
+	h.c.handle(msgEvent{Machine: testMachine, Ev: runtime.Event{Name: domain.ContainerName(u.ID, domain.RoleRunner), Action: "die"}})
+	if n := len(h.c.units); n != 1 || h.c.units[u.ID].State != domain.StateDying {
+		t.Fatalf("units=%d state=%s, want 죽은 unit 1개만(보충 없음)", n, h.c.units[u.ID].State)
+	}
+
+	// 동기화가 끝나면 평소대로 보충한다.
+	h.pumpUntil(isCleanupDone)
+	h.c.syncing = false
+	if got := h.desired(0); got != 1 || len(h.c.units) != 1 {
+		t.Fatalf("desired=%d units=%d, want 1/1 (minRunners 보충)", got, len(h.c.units))
 	}
 }
 

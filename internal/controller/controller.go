@@ -43,8 +43,10 @@ type MachineAgent interface {
 	Runtime() runtime.Runtime
 	Preflight(ctx context.Context) (runtime.Info, error)
 	// Run 은 events 를 열고 Resynced(전체 동기화 스냅샷)를 보낸 뒤 스트림을 소비한다. 첫 회차는
-	// Resynced 또는 Unhealthy 를 반드시 보낸다. [§7.1-7, §7.1-8]
+	// Resynced 또는 Unhealthy/Failed 를 반드시 보낸다. [§7.1-7, §7.1-8]
 	Run(ctx context.Context, sink machine.Sink)
+	// Close 는 접속(SSH)을 닫는다. 멱등이며 Run 이 어떤 경로로 끝나든 불린다. [§7.3]
+	Close() error
 }
 
 // Options 는 테스트가 바꿔 끼우는 의존성이다. nil 필드는 기본값을 쓴다.
@@ -123,6 +125,8 @@ type Controller struct {
 	checking  map[domain.UnitID]bool      // tick 의 GetRunner 대조 진행 중
 	startedAt map[domain.UnitID]time.Time // Creating → Starting 전이 시각. 그 전에 찍힌 스냅샷의 판정에서 제외 [§8.3 Creating 예외]
 	reached   map[string]bool             // 시작 시 preflight 도달 여부. R24 판정 [§6.2]
+	// syncing 은 시작 시 전체 동기화(§7.1-7)가 아직 끝나지 않았다는 뜻이다. 그동안은 unit 을 만들지 않는다.
+	syncing bool
 }
 
 // New 는 설정으로 상태를 조립한다. 네트워크·프로세스 실행은 Run 에서 한다.
@@ -171,6 +175,9 @@ func New(cfg *config.Config, gh github.Client, log *slog.Logger, opts Options) *
 // Run 은 §7.1 시작 순서를 밟은 뒤 §7.2 루프에 들어간다. ctx 취소로 끝난다(§7.3). [§7.1, §7.2, §7.3]
 func (c *Controller) Run(ctx context.Context) error {
 	c.ctx = ctx
+	// §7.3 "SSH 연결 정리". 시작 실패로 일찍 빠지는 경로에서도 만들어 둔 접속을 남기지 않는다.
+	// 정상 종료 경로에서는 에이전트 goroutine 을 먼저 기다린 뒤(wg.Wait) 여기에 온다.
+	defer c.closeAgents()
 	for _, w := range c.cfg.Warnings {
 		c.log.Warn(w)
 	}
@@ -186,6 +193,10 @@ func (c *Controller) Run(ctx context.Context) error {
 		c.agents[m.Name] = agent
 		info, err := agent.Preflight(ctx)
 		if err != nil {
+			// 설정·환경 모순(R16, R21)은 시작 실패. 도달 불가·명령 실패는 unhealthy 로 두고 계속한다. [§7.1-3]
+			if errors.Is(err, machine.ErrFatal) {
+				return fmt.Errorf("machine %q preflight: %w", m.Name, err)
+			}
 			c.log.Warn("machine unhealthy at start", "machine", m.Name, "err", err)
 			continue
 		}
@@ -213,6 +224,8 @@ func (c *Controller) Run(ctx context.Context) error {
 
 	// §7.1-7·8 전체 동기화 + events 스트림. 에이전트가 events 를 연 뒤 스냅샷을 보낸다(그 사이의 die 를
 	// 놓치지 않는 순서). unhealthy 머신도 에이전트가 백오프로 재접속을 시도한다.
+	// 동기화가 끝날 때까지는 unit 을 만들지 않는다(§8.2 의 slot 점유를 아직 다 모른다).
+	c.syncing = true
 	for _, m := range c.machines {
 		agent := c.agents[m.Name]
 		c.wg.Add(1)
@@ -226,6 +239,7 @@ func (c *Controller) Run(ctx context.Context) error {
 	if err := c.awaitInitialSync(ctx); err != nil {
 		return err
 	}
+	c.syncing = false
 
 	// §7.1-9 메시지 세션 + 루프.
 	for _, name := range c.ssOrder {
@@ -258,6 +272,15 @@ loop:
 	return nil
 }
 
+// closeAgents 는 만들어 둔 에이전트의 접속을 닫는다. [§7.3]
+func (c *Controller) closeAgents() {
+	for name, a := range c.agents {
+		if err := a.Close(); err != nil {
+			c.log.Warn("machine connection close failed", "machine", name, "err", err)
+		}
+	}
+}
+
 // awaitInitialSync 는 각 머신의 첫 Resynced/Unhealthy 가 올 때까지 inbox 를 처리한다. [§7.1-7, §7.1-8]
 func (c *Controller) awaitInitialSync(ctx context.Context) error {
 	waiting := map[string]bool{}
@@ -276,7 +299,7 @@ func (c *Controller) awaitInitialSync(ctx context.Context) error {
 			case msgResynced:
 				delete(waiting, m.Machine)
 			case msgHealth:
-				if !m.Healthy {
+				if m.Health != domain.Healthy {
 					delete(waiting, m.Machine)
 				}
 			}
@@ -286,12 +309,29 @@ func (c *Controller) awaitInitialSync(ctx context.Context) error {
 }
 
 // agentSpec 은 config 머신 항목을 machine.Spec 으로 바꾼다. pre-pull 대상은 runner 이미지(+sidecar). [§7.1-4]
+//
+// Verify 는 재접속 preflight 에서 R21 을 다시 판정한다(§7.1-3). 에이전트 goroutine 이 부르므로
+// Controller 상태를 읽지 않는다: 불변인 설정 값만 클로저에 담는다. [DESIGN §1-2, R21]
 func (c *Controller) agentSpec(m domain.Machine, ss *scaleSetState) machine.Spec {
 	images := []string{ss.RunnerImage}
 	if ss.Mode == domain.ModeSidecar && ss.SidecarImage != "" {
 		images = append(images, ss.SidecarImage)
 	}
-	return machine.Spec{Name: m.Name, Local: m.Local, Runtime: m.Runtime, Images: images}
+	cm := c.cfgMachine(m.Name)
+	unit, ssName := ss.Unit, ss.Name
+	spec := machine.Spec{
+		Name: m.Name, Local: m.Local, Runtime: m.Runtime, Mode: ss.Mode, Images: images,
+		Verify: func(info runtime.Info) error { return checkR21(cm, unit, ssName, info) },
+	}
+	if cm.SSH != nil {
+		spec.SSH = &machine.SSH{
+			Host: cm.SSH.Host, Port: cm.SSH.Port, User: cm.SSH.User,
+			KeyFile: cm.SSH.KeyFile, KeyPassphrase: cm.SSH.KeyPassphrase,
+			KnownHostsFile: cm.SSH.KnownHostsFile, Fingerprint: cm.SSH.Fingerprint,
+			InsecureSkipHostKeyVerify: cm.SSH.InsecureSkipHostKeyVerify,
+		}
+	}
+	return spec
 }
 
 // applyInfo 는 `info` 결과로 머신 예산과 physicalMax·effectiveMax 를 정한다. [§7.1-3, §8.1, R21, R22]
@@ -302,31 +342,56 @@ func (c *Controller) applyInfo(m *domain.Machine, info runtime.Info) error {
 	cm := c.cfgMachine(m.Name)
 	ss := c.scaleSets[m.ScaleSet]
 	detected := resource.Budget{CPU: info.CPUs, MemoryBytes: info.MemoryBytes}
-	budget := detected
+	budget := r21Budget(cm, info)
 	if cm.Resources != nil {
-		budget = *cm.Resources
-		if budget.CPU > detected.CPU {
-			c.log.Warn("R21 machine cpu exceeds detected, capped", "machine", m.Name, "configured", budget.CPU, "detected", detected.CPU)
-			budget.CPU = detected.CPU
+		if cm.Resources.CPU > detected.CPU {
+			c.log.Warn("R21 machine cpu exceeds detected, capped", "machine", m.Name, "configured", cm.Resources.CPU, "detected", detected.CPU)
 		}
-		if budget.MemoryBytes > detected.MemoryBytes {
-			c.log.Warn("R21 machine memory exceeds detected, capped", "machine", m.Name, "configured", budget.MemoryBytes, "detected", detected.MemoryBytes)
-			budget.MemoryBytes = detected.MemoryBytes
+		if cm.Resources.MemoryBytes > detected.MemoryBytes {
+			c.log.Warn("R21 machine memory exceeds detected, capped", "machine", m.Name, "configured", cm.Resources.MemoryBytes, "detected", detected.MemoryBytes)
 		}
 	}
 	physical := plan.PhysicalMax(budget, ss.Unit)
 	if physical == 0 {
-		return fmt.Errorf("R21 machine %q: resources (cpu=%g, memory=%d) < scale set %q unit (cpu=%g, memory=%d)",
-			m.Name, budget.CPU, budget.MemoryBytes, ss.Name, ss.Unit.CPU, ss.Unit.MemoryBytes)
+		return checkR21(cm, ss.Unit, ss.Name, info)
 	}
 	if cm.MaxRunners != nil && *cm.MaxRunners > physical {
 		c.log.Warn("R22 machine maxRunners exceeds physicalMax, capped", "machine", m.Name, "maxRunners", *cm.MaxRunners, "physicalMax", physical)
 	}
+	changed := c.budgets[m.Name] != budget || m.PhysicalMax != physical
 	c.budgets[m.Name] = budget
 	m.PhysicalMax = physical
 	m.EffectiveMax = plan.EffectiveMax(physical, cm.MaxRunners)
-	c.log.Info("machine ready", "machine", m.Name, "cpu", budget.CPU, "memoryBytes", budget.MemoryBytes,
+	log := c.log.Debug
+	if changed { // 재동기화마다 같은 값을 다시 알리지는 않는다
+		log = c.log.Info
+	}
+	log("machine ready", "machine", m.Name, "cpu", budget.CPU, "memoryBytes", budget.MemoryBytes,
 		"physicalMax", physical, "effectiveMax", m.EffectiveMax)
+	return nil
+}
+
+// r21Budget 은 R21 의 cap 규칙을 적용한 머신 예산이다: resources 생략이면 탐지값, 명시면
+// 탐지값을 상한으로 자른다(경고는 호출자가 남긴다). 순수 함수라 에이전트 goroutine 도 쓴다. [R21, §7.1-3]
+func r21Budget(cm config.Machine, info runtime.Info) resource.Budget {
+	detected := resource.Budget{CPU: info.CPUs, MemoryBytes: info.MemoryBytes}
+	if cm.Resources == nil {
+		return detected
+	}
+	return resource.Budget{
+		CPU:         min(cm.Resources.CPU, detected.CPU),
+		MemoryBytes: min(cm.Resources.MemoryBytes, detected.MemoryBytes),
+	}
+}
+
+// checkR21 은 "머신 예산 < unit 예산(physicalMax 0)" 위반이다. 시작 시에는 시작 실패,
+// 재접속 preflight 에서는 그 머신을 Failed 로 만든다. [R21, §7.1-3]
+func checkR21(cm config.Machine, unit resource.Budget, scaleSet string, info runtime.Info) error {
+	b := r21Budget(cm, info)
+	if plan.PhysicalMax(b, unit) == 0 {
+		return fmt.Errorf("R21 machine %q: resources (cpu=%g, memory=%d) < scale set %q unit (cpu=%g, memory=%d)",
+			cm.Name, b.CPU, b.MemoryBytes, scaleSet, unit.CPU, unit.MemoryBytes)
+	}
 	return nil
 }
 
@@ -389,7 +454,7 @@ func (c *Controller) observed(machineName string, snap machine.Snapshot) plan.Ob
 }
 
 func (c *Controller) resyncMsg(machineName string, snap machine.Snapshot) msgResynced {
-	return msgResynced{Machine: machineName, At: snap.At, Obs: c.observed(machineName, snap)}
+	return msgResynced{Machine: machineName, At: snap.At, Info: snap.Info, Obs: c.observed(machineName, snap)}
 }
 
 // send 는 goroutine 이 루프로 메시지를 보낸다. 루프가 끝났으면 버린다.
@@ -405,6 +470,11 @@ type sink struct{ c *Controller }
 
 func (s sink) Event(m string, ev runtime.Event) { s.c.send(msgEvent{Machine: m, Ev: ev}) }
 func (s sink) Unhealthy(m string, reason error) {
-	s.c.send(msgHealth{Machine: m, Healthy: false, Err: reason})
+	s.c.send(msgHealth{Machine: m, Health: domain.Unhealthy, Err: reason})
+}
+
+// Failed 는 재접속 후 preflight 에서 드러난 R16/R21 위반이다(재접속 없음). [§7.1-3, R21]
+func (s sink) Failed(m string, reason error) {
+	s.c.send(msgHealth{Machine: m, Health: domain.Failed, Err: reason})
 }
 func (s sink) Resynced(m string, snap machine.Snapshot) { s.c.send(s.c.resyncMsg(m, snap)) }

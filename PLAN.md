@@ -27,7 +27,7 @@
 | 7 | `controller` 최소(none, local, docker) + `cmd` — walking skeleton | §7 전체(none·local 범위), §8.3 정리 순서, §11 | §6, §9, §4.5 | TESTPLAN (controller/core). E2E-lite: 실제 repo에서 job 1개 완주(사람 실행) | 완료 2026-09-08 |
 | 8 | `executor/ssh` | §10.1, R20 | §4.1 | TESTPLAN (executor/ssh) | 완료 2026-09-08 |
 | 9 | `runtime/podman` | §9.2 podman info 형식, §10.2 규칙 3 경로 | §4.2 | TESTPLAN (runtime/podman). Phase 0-3 결과 필요 | 완료 2026-09-08 |
-| 10 | `machine` 에이전트 | §7.1-3·4·7·8, §10.2, R16, R21, R22 | §7, §3.3 | TESTPLAN (machine) | 미착수 |
+| 10 | `machine` 에이전트 | §7.1-3·4·7·8, §10.2, R16, R21, R22 | §7, §3.3 | TESTPLAN (machine) | 완료 2026-09-09 |
 | 11 | `controller` 확장: 입양·전체 동기화, tick 대조 완성, 축소(Draining), Dying 재시도, R24 | §7.2-3 축소, §8.3 전체, R24 | §6, §3.2 | TESTPLAN (controller/ext). E2E 1, 3, 4, 5 | 미착수 |
 | 12 | `systemd` + sidecar(컨테이너·볼륨·slice, docker/podman 변형) | §9 전체, §7.2-4 sidecar 래퍼, §10.2 sidecar 행 | §4.2 sidecar 표, §4.3, §6 startUnit | TESTPLAN (systemd), (runtime/sidecar). E2E 2. Phase 0-2 결과 필요 | 미착수 |
 

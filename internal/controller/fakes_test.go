@@ -228,6 +228,10 @@ type fakeAgent struct {
 
 func (a *fakeAgent) Name() string             { return a.name }
 func (a *fakeAgent) Runtime() runtime.Runtime { return a.rt }
+func (a *fakeAgent) Close() error {
+	a.add("Close %s", a.name)
+	return nil
+}
 
 // Preflight 는 실제 Agent 처럼 info 뒤 pre-pull 을 기록한다. [§7.1-3, §7.1-4]
 func (a *fakeAgent) Preflight(ctx context.Context) (runtime.Info, error) {
@@ -251,6 +255,10 @@ func (a *fakeAgent) Observe(context.Context) (machine.Snapshot, error) {
 func (a *fakeAgent) Run(ctx context.Context, sink machine.Sink) {
 	a.add("Run %s", a.name)
 	snap, _ := a.Observe(ctx)
+	// 실제 Agent 처럼 회차의 info 를 실어 보낸다(재접속 머신의 예산 재계산 재료). [§7.1-3, R21]
+	if info, err := a.rt.Info(ctx); err == nil {
+		snap.Info = info
+	}
 	sink.Resynced(a.name, snap)
 	<-ctx.Done()
 }
