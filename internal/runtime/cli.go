@@ -39,8 +39,10 @@ type flavor interface {
 	// eventsFormat 은 `events --format` 값이다. docker 는 `{{json .}}`, podman 은 `json`
 	// 리터럴이다(§5, TESTPLAN (runtime/podman)).
 	eventsFormat() string
-	// parseEvent 는 관심 없는 줄(다른 type, 깨진 JSON)에 ok=false 를 돌려준다.
-	parseEvent(line []byte) (ev Event, ok bool)
+	// parseEvent 는 세 갈래다: 우리 이벤트(ok=true), 관심 없는 줄(ok=false, err=nil),
+	// 읽지 못한 줄(err != nil). 셋을 구분하는 이유는 스키마가 어긋났을 때(버전 차이) 모든 줄이
+	// 조용히 버려지면 die 가 영영 오지 않는데 아무 신호도 남지 않기 때문이다. [§7.2-5]
+	parseEvent(line []byte) (ev Event, ok bool, err error)
 	parseInfo(out []byte) (Info, error)
 	isNotFound(stderr string) bool
 }
@@ -65,7 +67,7 @@ func parsePSLine(line []byte, createdLayout string) (Container, error) {
 	if fields[0] == "" {
 		return Container{}, fmt.Errorf("Names 없음: %s", line)
 	}
-	created, err := time.Parse(createdLayout, fields[2])
+	created, err := parsePSTime(fields[2], createdLayout)
 	if err != nil {
 		return Container{}, fmt.Errorf("CreatedAt %q: %w", fields[2], err)
 	}
@@ -76,6 +78,29 @@ func parsePSLine(line []byte, createdLayout string) (Container, error) {
 		}
 	}
 	return Container{Name: fields[0], State: fields[1], Created: created, Labels: labels}, nil
+}
+
+// parsePSTime 은 `ps` 의 CreatedAt 을 읽는다. 값은 `time.Time.String()` 형태라 끝에 오프셋과
+// zone 이름이 함께 온다("… +0900 KST"). zone 이름이 숫자 오프셋인 호스트(Asia/Kathmandu 는
+// "+0545 +0545")에서는 Go 가 그것을 zone 이름으로 인정하지 않아 파싱이 실패하는데
+// (time.parseSignedOffset 의 23시간 상한), 그 한 줄 때문에 List 전체가 오류가 되면 그 머신은
+// 매 회차 Observe 실패로 영구히 unhealthy 가 된다. 그래서 실패하면 마지막 토큰(zone 이름)을
+// 떼고 오프셋까지만으로 다시 읽는다 — 시각 값은 오프셋만으로 정확하다. [§7.1-7, §8.3]
+func parsePSTime(value, layout string) (time.Time, error) {
+	created, err := time.Parse(layout, value)
+	if err == nil {
+		return created, nil
+	}
+	zoneless := strings.TrimSuffix(layout, " MST")
+	if zoneless == layout {
+		return time.Time{}, err
+	}
+	if i := strings.LastIndex(value, " "); i > 0 {
+		if retry, err2 := time.Parse(zoneless, value[:i]); err2 == nil {
+			return retry, nil
+		}
+	}
+	return time.Time{}, err
 }
 
 // containsNotFoundMsg 는 docker/podman 이 공유하는 "이미 없음" 판별이다. 둘 다 stderr에
@@ -281,8 +306,17 @@ func (c *cli) Events(ctx context.Context, labelFilter string) (<-chan Event, <-c
 		defer rc.Close()
 		sc := bufio.NewScanner(rc)
 		sc.Buffer(make([]byte, 0, 64*1024), eventsLineMax)
+		// 읽지 못한 줄은 건너뛰되(한 줄 때문에 스트림을 끊으면 재시작 사이에 die 를 놓친다) 세어
+		// 두었다가 종료 오류에 함께 싣는다. 스키마가 통째로 어긋나면 이벤트가 하나도 오지 않는데,
+		// 그 상태가 "조용한 정상" 과 구분되지 않으면 진단할 방법이 없다. [§7.1-8, §7.2-5]
+		bad, lastBad := 0, error(nil)
 		for sc.Scan() {
-			ev, ok := c.f.parseEvent(sc.Bytes())
+			ev, ok, perr := c.f.parseEvent(sc.Bytes())
+			if perr != nil {
+				bad++
+				lastBad = perr
+				continue
+			}
 			if !ok {
 				continue
 			}
@@ -297,7 +331,11 @@ func (c *cli) Events(ctx context.Context, labelFilter string) (<-chan Event, <-c
 		if err == nil {
 			err = io.EOF
 		}
-		errCh <- fmt.Errorf("runtime: %s 스트림 종료: %w", strings.Join(cmd.Argv, " "), err)
+		msg := fmt.Errorf("runtime: %s 스트림 종료: %w", strings.Join(cmd.Argv, " "), err)
+		if bad > 0 {
+			msg = fmt.Errorf("%w (읽지 못한 줄 %d개, 마지막 오류: %v)", msg, bad, lastBad)
+		}
+		errCh <- msg
 	}()
 	return evCh, errCh
 }

@@ -100,15 +100,21 @@ func TestPodman_S9_2_InfoParse(t *testing.T) {
 
 // [§5, TESTPLAN (runtime/podman)] events: `--format json`(docker 의 `{{json .}}` 템플릿이
 // 아니다). Status "died" 를 공통 어휘 "die" 로 정규화하고, ContainerExitCode(최상위 필드,
-// docker 처럼 Actor.Attributes 를 거치지 않는다)를 ExitCode 로 옮긴다. Time 은 RFC3339Nano
-// 문자열이다. 아래 die 이외 줄들은 podman-events(1) 문서의 실제 예시다.
+// docker 처럼 Actor.Attributes 를 거치지 않는다)를 ExitCode 로 옮긴다.
+//
+// 아래 줄들은 **실제 podman 6.1.1 출력을 그대로 캡처한 것**이다(2026-09-09, macOS + podman
+// machine). 이전 픽스처는 문서 예시를 보고 지어낸 RFC3339 문자열 `"Time"` 이었는데, 실물은
+// 유닉스 정수 `time`/`timeNano` 라 unmarshal 이 실패했고 파서가 **모든 이벤트를 버렸다**
+// (die 가 영영 오지 않아 §7.2-5 정리 경로가 죽어 있었다). 정수·문자열 양쪽을 받는다.
 func TestPodman_S4_2_EventsNormalize(t *testing.T) {
 	f, rt := newPodmanFake(t, false)
 	f.stream = strings.Join([]string{
-		`{"ID":"683b0909d556a9c02fa8cd2b61c3531a965db42158627622d1a67b391964d519","Image":"localhost/myshdemo:latest","Name":"gh-ars-X-runner","Status":"start","Time":"2019-04-27T22:47:00.849932843-04:00","Type":"container"}`,
+		`{"ContainerExitCode":0,"ID":"52c7276fc13f","Image":"docker.io/library/alpine:3.20","Name":"gh-ars-X-runner","Status":"start","time":1788934693,"timeNano":1788934693113568389,"Type":"container","Attributes":{"gh-ars.unit":"X"}}`,
 		`not json at all`,
-		`{"ID":"683b0909d556a9c02fa8cd2b61c3531a965db42158627622d1a67b391964d519","ContainerExitCode":3,"Name":"gh-ars-X-runner","Status":"died","Time":"2019-04-27T22:47:05.212629470-04:00","Type":"container"}`,
-		`{"ID":"n1","Name":"bridge","Status":"connect","Time":"2019-04-27T22:47:05.3-04:00","Type":"network"}`,
+		`{"ContainerExitCode":3,"ID":"52c7276fc13f","Image":"docker.io/library/alpine:3.20","Name":"gh-ars-X-runner","Status":"died","time":1788934694,"timeNano":1788934694175539027,"Type":"container","Attributes":{"gh-ars.unit":"X"}}`,
+		// 구버전·문서 형식(RFC3339 문자열 "Time")도 계속 읽는다.
+		`{"ID":"683b0909d556","Name":"gh-ars-Y-runner","Status":"died","Time":"2019-04-27T22:47:05.212629470-04:00","Type":"container"}`,
+		`{"ID":"n1","Name":"bridge","Status":"connect","time":1788934695,"Type":"network"}`,
 		"",
 	}, "\n")
 	evCh, errCh := rt.Events(context.Background(), "gh-ars.unit")
@@ -120,11 +126,11 @@ func TestPodman_S4_2_EventsNormalize(t *testing.T) {
 	for ev := range evCh {
 		got = append(got, ev)
 	}
-	wantTime0, _ := time.Parse(time.RFC3339Nano, "2019-04-27T22:47:00.849932843-04:00")
-	wantTime1, _ := time.Parse(time.RFC3339Nano, "2019-04-27T22:47:05.212629470-04:00")
+	wantTimeOld, _ := time.Parse(time.RFC3339Nano, "2019-04-27T22:47:05.212629470-04:00")
 	want := []Event{
-		{Name: "gh-ars-X-runner", Action: "start", At: wantTime0},
-		{Name: "gh-ars-X-runner", Action: "die", ExitCode: 3, At: wantTime1},
+		{Name: "gh-ars-X-runner", Action: "start", At: time.Unix(0, 1788934693113568389)},
+		{Name: "gh-ars-X-runner", Action: "die", ExitCode: 3, At: time.Unix(0, 1788934694175539027)},
+		{Name: "gh-ars-Y-runner", Action: "die", At: wantTimeOld},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("events = %+v, want %+v", got, want)
@@ -134,8 +140,14 @@ func TestPodman_S4_2_EventsNormalize(t *testing.T) {
 			t.Errorf("event[%d] = %+v, want %+v", i, got[i], want[i])
 		}
 	}
-	if err, ok := <-errCh; !ok || err == nil {
+	// 읽지 못한 줄(`not json at all`)은 건너뛰되 종료 오류가 그 사실을 알린다: 스키마가 통째로
+	// 어긋나 이벤트가 하나도 안 오는 상태를 "조용한 정상" 과 구분할 수 있어야 한다. [§7.2-5]
+	err, ok := <-errCh
+	if !ok || err == nil {
 		t.Fatalf("스트림 종료 통지가 없다: ok=%v err=%v", ok, err)
+	}
+	if !strings.Contains(err.Error(), "읽지 못한 줄 1개") {
+		t.Fatalf("파싱 실패가 종료 오류에 실리지 않았다: %v", err)
 	}
 }
 
@@ -159,5 +171,18 @@ func TestPodman_S8_3_RemoveIdempotent(t *testing.T) {
 	f.results = []executor.Result{{ExitCode: 1, Stderr: []byte("boom")}}
 	if _, err := rt.List(ctx, "gh-ars.unit"); !errors.As(err, &ee) {
 		t.Fatalf("List 실패가 ExitError 가 아니다: %v", err)
+	}
+}
+
+// TestPodman_S4_2_EventWithoutNameIsUnparseable: docker 와 같은 규칙 — type=container 인데 이름이
+// 없으면 스키마 어긋남으로 세어 종료 오류에 신호를 남긴다. [§4.2, §7.2-5]
+func TestPodman_S4_2_EventWithoutNameIsUnparseable(t *testing.T) {
+	_, ok, err := podmanFlavor{}.parseEvent([]byte(`{"Type":"container","Status":"died","time":1788934694}`))
+	if ok || err == nil {
+		t.Fatalf("ok=%v err=%v, want 읽지 못한 줄", ok, err)
+	}
+	_, ok, err = podmanFlavor{}.parseEvent([]byte(`{"Type":"network","Status":"connect","Name":"bridge","time":1788934695}`))
+	if ok || err != nil {
+		t.Fatalf("ok=%v err=%v, want 관심 없는 줄(오류 아님)", ok, err)
 	}
 }

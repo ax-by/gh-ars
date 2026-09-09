@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-  Implementation-loop gate: go test -> go vet -> Codex review -> .loop/state.json.
+  Implementation-loop gate: go test -> go vet -> review (Codex or Claude) -> .loop/state.json.
 
 .DESCRIPTION
   Runs the deterministic checks for one PLAN.md Phase and records the outcome in .loop/state.json
@@ -19,7 +19,12 @@
 .EXAMPLE
   .\scripts\gate.ps1 -Phase 3 -Packages "internal/plan" -Spec "S7.2-3, S8.1-8.3" -Design "S5" -Base HEAD
   .\scripts\gate.ps1 -Phase 3 -Packages "internal/plan" -Spec "S8" -Design "S5" -TestOnly
-  .\scripts\gate.ps1 -Phase 3 ... -ReviewFromFile .codex-review\last.md   # re-parse a saved review (no Codex call)
+  .\scripts\gate.ps1 -Phase 3 ... -Reviewer claude   # Claude Code (opus 5, high) 로 리뷰
+  .\scripts\gate.ps1 -Phase 3 ... -ReviewFromFile .codex-review\last.md   # re-parse a saved review (no review call)
+
+  Reviewer: -Reviewer codex|claude (default codex, or $env:GH_ARS_REVIEWER). Both render the same
+  prompt template (docs/review/PROMPT.md) and produce the same output contract, so the verdict parsing
+  does not care which one ran. Use claude when Codex quota is out (or to get a second opinion).
 #>
 [CmdletBinding()]
 param(
@@ -29,7 +34,8 @@ param(
     [Parameter(Mandatory)] [string] $Design,
     [string] $Base = "none",
     [switch] $TestOnly,
-    [string] $ReviewFromFile = ""
+    [string] $ReviewFromFile = "",
+    [ValidateSet("codex","claude")] [string] $Reviewer = $(if ($env:GH_ARS_REVIEWER) { $env:GH_ARS_REVIEWER } else { "codex" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,7 +45,13 @@ Assert-GitRepo
 Set-Location $repo
 
 $goPs1 = Join-Path $PSScriptRoot "go.ps1"
-$reviewPs1 = Join-Path $PSScriptRoot "codex-review.ps1"
+if ($Reviewer -eq "claude") {
+    $reviewPs1 = Join-Path $PSScriptRoot "claude-review.ps1"
+    $reviewLabel = "claude review (opus 5, high)"
+} else {
+    $reviewPs1 = Join-Path $PSScriptRoot "codex-review.ps1"
+    $reviewLabel = "codex review (gpt-6-astra, medium)"
+}
 
 # --- state: load or create; reset review round when the phase changes
 $state = Read-State
@@ -51,7 +63,7 @@ if ($null -eq $state -or $state.phase -ne $Phase) {
 }
 
 # --- tests
-Write-Host "gate: phase=$Phase packages=$Packages"
+Write-Host "gate: phase=$Phase packages=$Packages reviewer=$Reviewer"
 Write-Host "gate: go test ./..."
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
@@ -104,7 +116,7 @@ if ($ReviewFromFile) {
     if (-not (Test-Path $ReviewFromFile)) { throw "review file not found: $ReviewFromFile" }
     $reviewText = [System.IO.File]::ReadAllText($ReviewFromFile, (Get-Utf8NoBom))
 } else {
-    Write-Host "gate: codex review (gpt-6-astra, medium) ..."
+    Write-Host "gate: $reviewLabel ..."
     $prevEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"   # child stderr lines must not terminate the gate (PS 5.1)
     try {

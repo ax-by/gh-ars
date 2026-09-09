@@ -195,7 +195,9 @@ func NewSSH(cfg SSHConfig) (Executor, error)   // 연결 유지, host key 검증
 
 **예외 하나**: 자식이 비0으로 끝나면 `os/exec` 가 `ExitError` 를 우선해 드레인 만료가 가려지고, 잘렸을 수 있는 출력이 `Result` 로 나간다. 비0 응답에서 stdout 을 신뢰하는 호출자가 없어(§10.2 규칙 3은 성패만, §8.3은 "이미 없음"만 본다) 허용한다.
 
-`SSHConfig`: Host, Port, User, KeyFile, KeyPassphrase, Fingerprint, KnownHostsFile, InsecureSkipHostKeyVerify, ConnectTimeout(10s 상수). 구현 라이브러리: `golang.org/x/crypto/ssh` + `knownhosts`.
+`SSHConfig`: Host, Port, User, KeyFile, KeyPassphrase, Fingerprint, KnownHostsFile, InsecureSkipHostKeyVerify, Log(R20 경고용). 접속 타임아웃 10s는 설정이 아니라 코드 상수 `sshConnectTimeout`이다(§3.2: 상수의 설정 노출은 non-goal). 구현 라이브러리: `golang.org/x/crypto/ssh` + `knownhosts`.
+
+**host key 알고리즘 선호 순서를 직접 정한다.** x/crypto의 기본 순서는 ed25519를 마지막에 두어 서버가 ecdsa/rsa를 고르게 만드는데, 사용자가 기록해 둔 `known_hosts` 항목·`fingerprint`는 보통 OpenSSH가 협상한 ed25519다. 그대로 두면 `ssh user@host`가 되는 정상 호스트가 gh-ars에서만 host key 불일치로 거부된다(실측 2026-09-09). 그래서 OpenSSH와 같은 순서(ed25519 → ecdsa → rsa)를 `ClientConfig.HostKeyAlgorithms`에 넣고, `known_hosts`가 그 호스트에 대해 다른 타입만 가진 경우에는 검증 실패에 실려 오는 `knownhosts.KeyError.Want`의 키 타입들로 **같은 10s 예산 안에서 한 번 더** 시도한다(파일의 와일드카드·해시 항목 매칭은 라이브러리가 이미 하므로 우리가 다시 파싱하지 않는다). [§10.1, R20]
 
 ### 4.2 Runtime  [§5, §7, §9]
 
@@ -256,7 +258,7 @@ func NewDocker(ex executor.Executor, sudo bool) Runtime   // sudo 는 §10.2 판
 func NewPodman(ex executor.Executor, sudo bool) Runtime
 ```
 
-docker/podman 구현은 argv 조립과 출력 파싱만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`. `info`는 두 runtime 모두 `--format '{{json .}}'`를 파싱한다. `events`는 docker만 `--format '{{json .}}'`를 쓰고, podman은 `--format json`(SPEC §5 명시)이다 — 둘 다 결과는 JSON Lines 한 줄씩이지만 podman의 이벤트 스키마 자체가 docker와 다르다(`flavor.eventsFormat()`으로 분기). `ps`는 `{{json .}}`를 쓰지 않는다: 그 출력의 `Labels`는 "k=v,k=v"를 이스케이프 없이 이어붙인 문자열이라 이미지가 물려준 라벨 값에 `,gh-ars.mode=none` 같은 조각이 있으면 실제 라벨을 덮어쓸 수 있다. 대신 `{{.Names}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label "gh-ars.unit"}}…` 처럼 §4.2의 gh-ars.* 키 5개를 하나씩 뽑는 탭 구분 템플릿을 쓰고, `Container.Labels`에는 그 키만 담는다(입양 복원에 그것만 필요하다). 비0 종료는 `*ExitError{Argv, ExitCode, Stderr}`로 올리고, `Remove`/`VolumeRemove`는 "이미 없음" 응답을 성공으로 흡수한다(§8.3 멱등).
+docker/podman 구현은 argv 조립과 출력 파싱만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`. `info`는 두 runtime 모두 `--format '{{json .}}'`를 파싱한다. `events`는 docker만 `--format '{{json .}}'`를 쓰고, podman은 `--format json`(SPEC §5 명시)이다 — 둘 다 결과는 JSON Lines 한 줄씩이지만 podman의 이벤트 스키마 자체가 docker와 다르다(`flavor.eventsFormat()`으로 분기). podman의 시각 필드는 버전에 따라 유닉스 정수(`time`, `timeNano`)로도 RFC3339 문자열(`Time`)로도 오므로 양쪽을 모두 받는다 — 정수를 `time.Time`으로 받으려다 unmarshal이 실패하면 그 줄이 통째로 버려지고, 그러면 **모든** 이벤트가 사라져 `die`가 영영 오지 않는다(실측 podman 6.1.1, 2026-09-09). 같은 이유로 `flavor.parseEvent`는 "관심 없는 줄"과 "읽지 못한 줄"을 구분하고, `Events`는 읽지 못한 줄 수를 세어 스트림 종료 오류에 실어 보낸다: 스키마가 통째로 어긋난 상태와 "조용한 정상"이 구분되지 않으면 진단할 방법이 없다. `ps`는 `{{json .}}`를 쓰지 않는다: 그 출력의 `Labels`는 "k=v,k=v"를 이스케이프 없이 이어붙인 문자열이라 이미지가 물려준 라벨 값에 `,gh-ars.mode=none` 같은 조각이 있으면 실제 라벨을 덮어쓸 수 있다. 대신 `{{.Names}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label "gh-ars.unit"}}…` 처럼 §4.2의 gh-ars.* 키 5개를 하나씩 뽑는 탭 구분 템플릿을 쓰고, `Container.Labels`에는 그 키만 담는다(입양 복원에 그것만 필요하다). 비0 종료는 `*ExitError{Argv, ExitCode, Stderr}`로 올리고, `Remove`/`VolumeRemove`는 "이미 없음" 응답을 성공으로 흡수한다(§8.3 멱등).
 
 **sidecar 컨테이너 CreateSpec 값** [§9.1]:
 

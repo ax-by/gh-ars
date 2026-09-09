@@ -112,6 +112,14 @@ Phase 7 코드 범위: local executor + docker + none 모드. SSH 머신·podman
 | 4 | SSH 단절 → 배치 제외·capacity 감소 | 미실행 | |
 | 5 | scaleset delete | 미실행 | |
 
+### 스모크 확인 (2026-09-09, E2E 아님 — GitHub·job 없이 머신 경로만)
+
+Mac(개발 머신) 위에서 SSH 머신(localhost, Docker Desktop)과 podman 머신(podman 6.1.1, applehv VM)에 대해 preflight → events → `create`→`cp -`→`start` → die → rm 을 실제로 태웠다. 임시 `-tags manual` 테스트로 수행했고 리포에는 남기지 않았다(스크래치패드 보관).
+
+통과: SSH 접속·`id -u`·`docker info` 파싱·pre-pull, SSH 채널 위 events 수신, **stdin tar 가 SSH 를 넘어 컨테이너 안에 도착**(종료 코드 0 = `.jitconfig` 존재), 라벨 필터 ps/volume ls, `VolumeRemove` 멱등, podman 경로 고정(rootless)·`info` 파싱(`v2`→`2`).
+
+여기서 실제 버그 2개가 드러나 고쳤다: podman 이벤트 시각 필드 스키마 불일치로 **모든 이벤트가 버려지던 것**(die 미수신), SSH host key 알고리즘 선호 순서 불일치로 **정상 호스트가 거부되던 것**. 둘 다 수정 후 같은 절차로 재확인했다. E2E 1·4(실제 job·SSH 단절)는 여전히 미실행이다.
+
 ## 남은 결정
 
 구현 시 기본값으로 정하기로 한 항목(URL 판별 규칙, `${file:}` 공백 제거, 다이제스트 참조 허용, `RunnerSetting{Ephemeral, DisableUpdate}`, 세션 owner 문자열)은 코드 주석에 근거를 남긴다. 완료한 결정은 이 목록에서 지운다(근거는 `docs/DECISIONS.md`).

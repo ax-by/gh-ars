@@ -49,7 +49,8 @@ type sshExecutor struct {
 // ssh.Dial 의 Timeout 은 TCP 연결에만 적용되고 그 뒤 키 교환·인증에는 상한이 없다
 // (x/crypto/ssh 계약). SPEC §10.1 의 "접속 타임아웃 10s"는 시도 1회 전체를 뜻하므로,
 // dial 전에 데드라인 하나를 정해 TCP 연결과 NewClientConn(키 교환+인증) 양쪽에 그대로
-// 쓴다(각 단계에 새로 10s씩 주면 최악의 경우 거의 20s가 된다).
+// 쓴다(각 단계에 새로 10s씩 주면 최악의 경우 거의 20s가 된다). 아래의 재시도도 같은
+// 데드라인을 공유한다.
 func NewSSH(cfg SSHConfig) (Executor, error) {
 	log := cfg.Log
 	if log == nil {
@@ -64,12 +65,63 @@ func NewSSH(cfg SSHConfig) (Executor, error) {
 		return nil, fmt.Errorf("executor/ssh: 키 파일 %s: %w", cfg.KeyFile, err)
 	}
 	clientCfg := &ssh.ClientConfig{
-		User:            cfg.User,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: hostKeyCB,
+		User:              cfg.User,
+		Auth:              []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback:   hostKeyCB,
+		HostKeyAlgorithms: hostKeyPreference,
 	}
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	deadline := time.Now().Add(sshConnectTimeout)
+	client, err := dialSSH(addr, clientCfg, deadline)
+	// known_hosts 에 그 호스트의 다른 키 타입만 있으면 검증이 "key mismatch" 로 실패한다. 그때
+	// KeyError.Want 가 파일이 실제로 가진 키들을 알려주므로, 그 타입들로 한 번 더 시도한다.
+	// (파일 매칭 규칙 — 와일드카드·해시 항목 — 은 라이브러리가 이미 안다. 우리가 다시 파싱하지
+	// 않는 이유다.) 재시도도 같은 10s 예산 안에서 한다. [§10.1, R20]
+	var keyErr *knownhosts.KeyError
+	if err != nil && errors.As(err, &keyErr) && len(keyErr.Want) > 0 {
+		retryCfg := *clientCfg
+		retryCfg.HostKeyAlgorithms = knownKeyTypes(keyErr.Want)
+		if len(retryCfg.HostKeyAlgorithms) > 0 {
+			log.Debug("executor/ssh: known_hosts 의 키 타입으로 재시도", "host", cfg.Host, "algos", retryCfg.HostKeyAlgorithms)
+			client, err = dialSSH(addr, &retryCfg, deadline)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &sshExecutor{client: client}, nil
+}
+
+// hostKeyPreference 는 OpenSSH 의 host key 선호 순서다. x/crypto 의 기본값은 ed25519 를 마지막에
+// 두어 서버가 ecdsa/rsa 를 고르게 만드는데, 사용자가 기록해 둔 fingerprint·known_hosts 항목은
+// 보통 OpenSSH 가 협상한 ed25519 다. 순서를 맞추지 않으면 `ssh user@host` 는 되는 정상 호스트가
+// gh-ars 에서만 host key 불일치로 거부된다. [§10.1, R20]
+var hostKeyPreference = []string{
+	ssh.KeyAlgoED25519,
+	ssh.KeyAlgoECDSA256, ssh.KeyAlgoECDSA384, ssh.KeyAlgoECDSA521,
+	ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSA,
+}
+
+// knownKeyTypes 는 known_hosts 가 그 호스트에 대해 가진 키 타입들이다(중복 제거, 파일 순서 유지).
+func knownKeyTypes(want []knownhosts.KnownKey) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, k := range want {
+		if k.Key == nil {
+			continue
+		}
+		t := k.Key.Type()
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// dialSSH 는 접속 한 번이다. deadline 은 TCP 연결과 키 교환·인증 전체에 걸린다(§10.1 "시도
+// 1회당 접속 타임아웃 10s"). ssh.Dial 의 Timeout 은 TCP 에만 적용되므로 직접 건다.
+func dialSSH(addr string, clientCfg *ssh.ClientConfig, deadline time.Time) (*ssh.Client, error) {
 	conn, err := net.DialTimeout("tcp", addr, time.Until(deadline))
 	if err != nil {
 		return nil, fmt.Errorf("executor/ssh: %s 접속: %w", addr, err)
@@ -87,7 +139,7 @@ func NewSSH(cfg SSHConfig) (Executor, error) {
 		_ = sc.Close()
 		return nil, fmt.Errorf("executor/ssh: %s: %w", addr, err)
 	}
-	return &sshExecutor{client: ssh.NewClient(sc, chans, reqs)}, nil
+	return ssh.NewClient(sc, chans, reqs), nil
 }
 
 // sshHostKeyCallback 은 R20 의 우선순위를 구현한다: 우회(InsecureSkipHostKeyVerify)가

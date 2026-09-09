@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Implementation-loop gate: go test -> go vet -> Codex review -> .loop/state.json.
+# Implementation-loop gate: go test -> go vet -> review (Codex or Claude) -> .loop/state.json.
 # Mac/bash port of gate.ps1 -- same steps, same state.json schema, same verdict parsing.
 #
 # Runs the deterministic checks for one PLAN.md Phase and records the outcome in .loop/state.json
@@ -12,7 +12,12 @@
 # Usage:
 #   ./scripts/gate.sh --phase 3 --packages "internal/plan" --spec "S7.2-3, S8.1-8.3" --design "S5" --base HEAD
 #   ./scripts/gate.sh --phase 3 --packages "internal/plan" --spec "S8" --design "S5" --test-only
+#   ./scripts/gate.sh --phase 3 ... --reviewer claude    # Claude Code (opus 5, high) 로 리뷰
 #   ./scripts/gate.sh --phase 3 ... --review-from-file .codex-review/last.md   # re-parse a saved review
+#
+# Reviewer: --reviewer codex|claude (default codex, or $GH_ARS_REVIEWER). Both render the same prompt
+# template (docs/review/PROMPT.md) and produce the same output contract, so the verdict parsing below
+# does not care which one ran. Use claude when Codex quota is out (or to get a second opinion).
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -28,6 +33,7 @@ DESIGN=""
 BASE="none"
 TEST_ONLY=0
 REVIEW_FROM_FILE=""
+REVIEWER="${GH_ARS_REVIEWER:-codex}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -38,6 +44,7 @@ while [ $# -gt 0 ]; do
         --base) BASE="$2"; shift 2 ;;
         --test-only) TEST_ONLY=1; shift ;;
         --review-from-file) REVIEW_FROM_FILE="$2"; shift 2 ;;
+        --reviewer) REVIEWER="$2"; shift 2 ;;
         *) echo "gate: unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -47,7 +54,11 @@ done
 [ -z "$DESIGN" ] && { echo "gate: --design is required" >&2; exit 1; }
 
 GO_SH="$SCRIPT_DIR/go.sh"
-REVIEW_SH="$SCRIPT_DIR/codex-review.sh"
+case "$REVIEWER" in
+    codex)  REVIEW_SH="$SCRIPT_DIR/codex-review.sh";  REVIEW_LABEL="codex review (gpt-6-astra, medium)" ;;
+    claude) REVIEW_SH="$SCRIPT_DIR/claude-review.sh"; REVIEW_LABEL="claude review (opus 5, high)" ;;
+    *) echo "gate: unknown --reviewer: $REVIEWER (codex|claude)" >&2; exit 1 ;;
+esac
 
 # --- state: load or create; reset review round when the phase changes
 STATE="$(read_state)"
@@ -58,7 +69,7 @@ else
 fi
 
 # --- tests
-echo "gate: phase=$PHASE packages=$PACKAGES"
+echo "gate: phase=$PHASE packages=$PACKAGES reviewer=$REVIEWER"
 echo "gate: go test ./..."
 TEST_OUT="$("$GO_SH" test ./... 2>&1)" && TEST_CODE=0 || TEST_CODE=$?
 echo "$TEST_OUT"
@@ -100,7 +111,7 @@ if [ -n "$REVIEW_FROM_FILE" ]; then
     [ -f "$REVIEW_FROM_FILE" ] || { echo "gate: review file not found: $REVIEW_FROM_FILE" >&2; exit 1; }
     REVIEW_TEXT="$(cat "$REVIEW_FROM_FILE")"
 else
-    echo "gate: codex review (gpt-6-astra, medium) ..."
+    echo "gate: $REVIEW_LABEL ..."
     REVIEW_TEXT="$("$REVIEW_SH" --phase "Phase $PHASE" --packages "$PACKAGES" --spec "$SPEC" --design "$DESIGN" --base "$BASE" 2>&1)" && REVIEW_CODE=0 || REVIEW_CODE=$?
     printf '%s' "$REVIEW_TEXT" >"$LAST_REVIEW_PATH"
     if [ "$REVIEW_CODE" -ne 0 ]; then

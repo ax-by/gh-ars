@@ -20,9 +20,10 @@
 - (plan) spread 배치와 tie-break: 동률 시 결정적 순서, Foreign·Dying의 slot 점유 반영 (§8.2).
 - (plan) reconcile 판정표 §8.3 중 부품 집합으로 판정하는 행 전부: 입양(scale set 없음·machine 다름), 부품 일부 없음, exited, 머신 내부 고아. 등록 관련 행은 (controller).
 - (executor/ssh) host key 검증 순서(fingerprint → known_hosts → 거부), `insecureSkipHostKeyVerify` 경고 (R20).
+- (executor/ssh) host key 알고리즘 선호 순서가 OpenSSH와 같고(ed25519 우선), known_hosts가 가진 타입만 재시도 목록이 된다 (§10.1, R20).
 - (executor/local) `Cmd.Sudo` 접두, stdin 전달, Stream 종료 통지 (§5).
 - (runtime/docker) docker argv 조립과 출력 파싱: ps -a 라벨 필터, none create 플래그(--cpus/--memory, 라벨, entrypoint 래퍼), events JSON 정규화, `Info` 파싱 (DESIGN §4.2).
-- (runtime/podman) podman과 docker의 차이: events JSON 필드, `Info`의 `v2` → `2`·`Rootless`, `Cmd.Sudo` 접두 전파 (DESIGN §4.2, §10.2 규칙 3).
+- (runtime/podman) podman과 docker의 차이: events JSON 필드(**픽스처는 실제 podman 출력을 캡처한 것이어야 한다** — 지어낸 스키마는 파서가 모든 줄을 버려도 통과한다), 시각 필드의 정수·문자열 양쪽 수용, 읽지 못한 줄이 스트림 종료 오류에 실리는지, `Info`의 `v2` → `2`·`Rootless`, `Cmd.Sudo` 접두 전파 (DESIGN §4.2, §10.2 규칙 3).
 - (runtime/sidecar) sidecar create 플래그(--cgroup-parent, --privileged, 볼륨 3개 마운트 경로, dind/podman 명령·env)와 runner 컨테이너의 `DOCKER_HOST`/`CONTAINER_HOST` (§9.1, DESIGN §4.2 표).
 - (runtime/jittar) `.jitconfig` 1개짜리 tar 스트림 생성(경로·mode 0600·uid/gid 1001)과 `cp -` 대상 경로 `/home/runner`, 모드별 래퍼 문자열이 SPEC §7.2-4와 일치 (§7.2-4).
 - (systemd) set-property/stop/revert argv, `Check`의 sudo 분기 (§9.3, §10.2).

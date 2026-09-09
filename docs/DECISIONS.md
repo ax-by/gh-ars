@@ -4,6 +4,9 @@
 
 | 결정 | 이유 | 대안 |
 |---|---|---|
+| podman 실행 경로(sudo 유무)를 머신 수명 동안 고정 [§10.2 규칙 3] | rootless와 rootful은 컨테이너 저장소가 서로 다르다. 재접속 때 경로를 다시 협상하면 이미 도는 unit이 안 보이게 되고, 재동기화가 그 부품을 "사라졌다"고 판정해 지운다. 고정 경로가 실패하면 다른 저장소로 갈아타지 않고 unhealthy로 두고 같은 경로를 재시도한다 | 매 preflight마다 규칙 3 재실행(저장소가 바뀔 수 있음) |
+| SSH host key 알고리즘을 OpenSSH 순서로 고정하고 실패 시 known_hosts의 타입으로 1회 재시도 [§10.1, R20] | x/crypto 기본 순서는 ed25519가 마지막이라 서버가 ecdsa/rsa를 고르는데, 사용자의 known_hosts·fingerprint는 보통 ed25519다. 순서를 맞추지 않으면 정상 호스트가 거부된다(실측). 재시도 재료는 `KeyError.Want`가 주므로 파일을 다시 파싱하지 않는다 | known_hosts를 직접 파싱해 타입 추출(와일드카드·해시 항목 매칭을 재구현해야 함) / 사용자에게 모든 키 타입을 넣으라고 요구 |
+| podman 이벤트 시각 필드를 정수·문자열 양쪽 수용 | 버전에 따라 `time`/`timeNano` 정수 또는 `Time` 문자열로 온다. 한쪽만 받으면 unmarshal 실패로 **모든 이벤트가 버려져** die가 사라진다(실측 podman 6.1.1). 시각은 로그용이라 못 읽어도 줄은 살린다 | 특정 podman 버전 고정 / 시각 필드 무시 |
 | listener 패키지 사용 | 세션·폴링·ack·acquire를 검증된 구현에 맡김. 우리는 Scaler 3개 메서드만 구현 | MessageSessionClient 직접 사용 (제어는 늘지만 코드·버그 증가) |
 | 단일 Controller goroutine | 상태 경합 제거, 테스트에서 메시지 시퀀스로 재현 가능 | 머신별 락 |
 | unit 생성/정리는 goroutine + 결과 메시지 | 느린 SSH/pull이 루프를 막지 않음 | 루프 안에서 동기 실행 |

@@ -58,14 +58,19 @@ type dockerEvent struct {
 	TimeNano int64 `json:"timeNano"`
 }
 
-func (dockerFlavor) parseEvent(line []byte) (Event, bool) {
+func (dockerFlavor) parseEvent(line []byte) (Event, bool, error) {
 	var e dockerEvent
-	if err := json.Unmarshal(line, &e); err != nil || e.Type != "container" {
-		return Event{}, false
+	if err := json.Unmarshal(line, &e); err != nil {
+		return Event{}, false, fmt.Errorf("runtime: docker event 파싱: %w", err)
+	}
+	if e.Type != "container" {
+		return Event{}, false, nil
 	}
 	name := e.Actor.Attributes["name"]
 	if name == "" {
-		return Event{}, false
+		// 구독이 이미 type=container 로 좁혀져 있으므로 이름 없는 줄은 스키마가 어긋난 것이다.
+		// 조용히 버리면 die 가 전부 사라져도 아무 신호가 없다. [§4.2, §7.2-5]
+		return Event{}, false, fmt.Errorf("runtime: docker event 이름 없음: %s", line)
 	}
 	ev := Event{Name: name, Action: e.Action, At: time.Unix(0, e.TimeNano)}
 	if s, ok := e.Actor.Attributes["exitCode"]; ok {
@@ -73,7 +78,7 @@ func (dockerFlavor) parseEvent(line []byte) (Event, bool) {
 			ev.ExitCode = code
 		}
 	}
-	return ev, true
+	return ev, true, nil
 }
 
 // dockerInfo 는 `docker info --format '{{json .}}'` 중 쓰는 필드다. 데몬에 못 닿으면

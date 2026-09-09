@@ -125,3 +125,38 @@ func TestSSHHostKeyCallback_R20_InsecureOverridesOthers(t *testing.T) {
 		t.Fatalf("우회했는데 거부됨: %v", err)
 	}
 }
+
+// TestSSH_R20_HostKeyPreferenceEd25519First: host key 알고리즘 선호 순서는 OpenSSH 와 같아야 한다.
+// x/crypto 의 기본 순서는 ed25519 를 마지막에 두어 서버가 ecdsa/rsa 를 고르게 만드는데, 사용자가
+// 기록해 둔 known_hosts 항목·fingerprint 는 보통 OpenSSH 가 협상한 ed25519 다. 순서를 맞추지
+// 않으면 `ssh user@host` 는 되는 정상 호스트가 "knownhosts: key mismatch" 로 거부된다
+// (실측 2026-09-09, macOS sshd: ed25519 항목만 있는 known_hosts 로 접속 실패). [§10.1, R20]
+func TestSSH_R20_HostKeyPreferenceEd25519First(t *testing.T) {
+	if len(hostKeyPreference) == 0 || hostKeyPreference[0] != ssh.KeyAlgoED25519 {
+		t.Fatalf("선호 순서 = %v, want ed25519 우선", hostKeyPreference)
+	}
+	for _, want := range []string{ssh.KeyAlgoECDSA256, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA} {
+		found := false
+		for _, got := range hostKeyPreference {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s 가 빠져 그 타입만 가진 호스트에 접속할 수 없다: %v", want, hostKeyPreference)
+		}
+	}
+}
+
+// TestSSH_R20_KnownKeyTypes: known_hosts 가 그 호스트에 대해 가진 키 타입만, 중복 없이, 파일
+// 순서대로 뽑는다. 이 목록이 "key mismatch" 재시도의 HostKeyAlgorithms 가 된다. [§10.1, R20]
+func TestSSH_R20_KnownKeyTypes(t *testing.T) {
+	k1, k2 := genKey(t), genKey(t)
+	got := knownKeyTypes([]knownhosts.KnownKey{{Key: k1}, {Key: k2}, {Key: nil}})
+	if len(got) != 1 || got[0] != ssh.KeyAlgoED25519 {
+		t.Fatalf("knownKeyTypes = %v, want [%s] (같은 타입은 한 번, nil 은 무시)", got, ssh.KeyAlgoED25519)
+	}
+	if len(knownKeyTypes(nil)) != 0 {
+		t.Fatal("항목이 없으면 빈 목록이어야 한다(그래야 기본 선호 순서를 그대로 쓴다)")
+	}
+}

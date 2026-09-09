@@ -413,3 +413,46 @@ func TestDocker_S7_1_8_EventsCtxCancel(t *testing.T) {
 		t.Fatal("취소 후에도 error 채널 통지가 없다")
 	}
 }
+
+// TestPS_S7_1_7_NumericZoneName: zone 이름이 숫자 오프셋인 호스트에서도 `ps` 한 줄을 읽는다.
+// Asia/Kathmandu(+0545)·Asia/Tehran(+0330) 같은 TZ 에서 `time.Time.String()` 은 "… +0545 +0545"
+// 를 내는데, Go 는 그 zone 이름을 인정하지 않는다(parseSignedOffset 의 23시간 상한). 한 줄 실패가
+// List 전체를 오류로 만들면 그 머신은 매 회차 Observe 실패로 영구히 unhealthy 가 된다. [§7.1-7, §8.3]
+func TestPS_S7_1_7_NumericZoneName(t *testing.T) {
+	for _, tc := range []struct {
+		name, value, layout string
+		wantOffsetSec       int
+	}{
+		{"docker +0545", "2026-09-07 16:03:42 +0545 +0545", dockerPSCreatedLayout, 5*3600 + 45*60},
+		{"podman +0330", "2026-09-07 16:03:42.123456789 +0330 +0330", podmanPSCreatedLayout, 3*3600 + 30*60},
+		{"docker 이름 있는 zone", "2026-09-07 16:03:42 +0900 KST", dockerPSCreatedLayout, 9 * 3600},
+	} {
+		got, err := parsePSTime(tc.value, tc.layout)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if _, off := got.Zone(); off != tc.wantOffsetSec {
+			t.Fatalf("%s: 오프셋 %d초, want %d초", tc.name, off, tc.wantOffsetSec)
+		}
+		if got.UTC().Format("2006-01-02 15:04:05") == "" {
+			t.Fatalf("%s: 시각이 비었다", tc.name)
+		}
+	}
+	if _, err := parsePSTime("not a date", dockerPSCreatedLayout); err == nil {
+		t.Fatal("진짜 깨진 값은 오류여야 한다")
+	}
+}
+
+// TestDocker_S4_2_EventWithoutNameIsUnparseable: 구독이 이미 type=container 로 좁혀져 있으므로
+// 이름 없는 줄은 "관심 없는 줄"이 아니라 스키마 어긋남이다. 조용히 버리면 die 가 전부 사라져도
+// 아무 신호가 남지 않는다(podman 시각 필드에서 실제로 겪은 실패). [§4.2, §7.2-5]
+func TestDocker_S4_2_EventWithoutNameIsUnparseable(t *testing.T) {
+	_, ok, err := dockerFlavor{}.parseEvent([]byte(`{"Type":"container","Action":"die","Actor":{"Attributes":{}},"timeNano":1}`))
+	if ok || err == nil {
+		t.Fatalf("ok=%v err=%v, want 읽지 못한 줄", ok, err)
+	}
+	_, ok, err = dockerFlavor{}.parseEvent([]byte(`{"Type":"network","Action":"connect","Actor":{"Attributes":{}}}`))
+	if ok || err != nil {
+		t.Fatalf("ok=%v err=%v, want 관심 없는 줄(오류 아님)", ok, err)
+	}
+}
