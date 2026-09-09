@@ -23,7 +23,7 @@ K8s 없이 정적 머신(SSH 또는 local) 위에서 docker/podman 컨테이너�
   .\scripts\go.ps1 build ./...
   .\scripts\gate.ps1 -Phase N -Packages "internal/x" -Spec "S8.1" -Design "S5" -Base HEAD -TestOnly  # test + vet 만
   .\scripts\gate.ps1 -Phase N -Packages "internal/x" -Spec "S8.1" -Design "S5" -Base HEAD            # + Codex 리뷰, state 기록
-  .\scripts\gate.ps1 -Phase N ... -Base none -Reviewer claude                                       # 리뷰어를 Claude(opus 5, high)로
+  .\scripts\gate.ps1 -Phase N ... -Base none -Reviewer claude                                       # 리뷰어를 Claude(opus 5, medium)로
   .\scripts\commit.ps1 -Phase N -Message "<type>(<pkg>): ... (Phase N, SPEC §n)"                   # 게이트 통과 시에만
   ```
   Mac은 동일한 인자를 long option으로:
@@ -34,7 +34,7 @@ K8s 없이 정적 머신(SSH 또는 local) 위에서 docker/podman 컨테이너�
   ./scripts/gate.sh --phase N ... --base none --reviewer claude
   ./scripts/commit.sh --phase N --message "<type>(<pkg>): ... (Phase N, SPEC §n)"
   ```
-  리뷰어는 둘 중 하나다: `codex`(기본, gpt-6-astra/medium) 또는 `claude`(opus 5/high). 프롬프트 템플릿(`docs/review/PROMPT.md`)과 출력 계약이 같아 게이트는 어느 쪽이든 동일하게 판정한다. 기본값은 `GH_ARS_REVIEWER` 환경변수로도 바꾼다. Claude 리뷰는 컨텍스트를 공유하지 않는 새 세션(`claude -p`)에서 읽기 전용 도구만으로 돈다.
+  리뷰어는 둘 중 하나다: `codex`(기본, gpt-6-astra/medium) 또는 `claude`(opus 5/medium. `--effort high` 로 올릴 수 있으나 패키지 하나에 12~15분이 든다). 프롬프트 템플릿(`docs/review/PROMPT.md`)과 출력 계약이 같아 게이트는 어느 쪽이든 동일하게 판정한다. 기본값은 `GH_ARS_REVIEWER` 환경변수로도 바꾼다. Claude 리뷰는 컨텍스트를 공유하지 않는 새 세션(`claude -p`)에서 읽기 전용 도구만으로 돈다.
   `--base`(`-Base`)는 리뷰 범위다: **수정 위주 Phase에서는 `none`을 쓴다.** `HEAD`를 주면 리뷰어가 보는 것은 `git diff HEAD..HEAD`(빈 diff) + 미추적 파일뿐이라 **수정된 추적 파일이 리뷰에서 통째로 빠진다.**
   절 번호 인자는 `§` 대신 ASCII `S`로 쓴다(`S8.1` = §8.1. Windows 콘솔 코드페이지 문제로 시작된 관례지만, 두 머신에서 동일한 호출 문법을 쓰기 위해 Mac 쪽에도 그대로 유지). 게이트 상태는 `.loop/state.json`(gitignore)에 남는다.
 - `.go` 편집 시 gofmt/vet 훅이 자동으로 돈다. Windows는 `.claude/settings.json`에서 `scripts/hooks/go-check.ps1`을 `powershell.exe`로 직접 실행. Mac은 `.claude/settings.local.json`(gitignore, 개인 설정)에서 `scripts/hooks/go-check.sh`를 `bash`로 실행 — 팀 공유 `settings.json`은 건드리지 않는다. 훅 실패는 즉시 고친다.

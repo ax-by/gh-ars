@@ -1,8 +1,10 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,8 +20,10 @@ func newDockerFake(t *testing.T) (*fakeExec, Runtime) {
 	return f, NewDocker(f, false, testLogger())
 }
 
-// [DESIGN §4.2] docker 구현의 Kind 와 sudo. docker 는 §10.2 규칙 2 에 따라 sudo 를 쓰지 않는다.
-func TestDocker_S10_2_KindAndNoSudo(t *testing.T) {
+// [DESIGN §4.2] docker 구현이 Kind 와 받은 sudo 값을 명령에 그대로 전파하는지 본다. "docker 는
+// sudo 를 쓰지 않는다"(§10.2 규칙 2)를 강제하는 곳은 이 생성자가 아니라 preflight 이며, 그
+// 판정은 machine 패키지가 검증한다(TestPreflight_S10_2_DockerNoSudo).
+func TestDocker_S5_KindAndSudoPropagation(t *testing.T) {
 	f, rt := newDockerFake(t)
 	if rt.Kind() != domain.RuntimeDocker {
 		t.Fatalf("Kind = %v", rt.Kind())
@@ -417,6 +421,36 @@ func TestDocker_S7_1_8_EventsCtxCancel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("취소 후에도 error 채널 통지가 없다")
+	}
+}
+
+// TestDocker_S4_2_UnparseableLineSignal: 읽지 못한 줄은 첫 줄 즉시 경고 + 종료 오류의 집계로
+// 알린다(podman 과 같은 계약. TESTPLAN 은 두 flavor 모두에 이 항목을 건다). [DESIGN §4.2, §7.2-5]
+func TestDocker_S4_2_UnparseableLineSignal(t *testing.T) {
+	var logs bytes.Buffer
+	f := &fakeExec{}
+	f.stream = strings.Join([]string{
+		`not json at all`,
+		`{"Type":"network","Action":"connect","Actor":{"Attributes":{"name":"bridge"}},"timeNano":1}`,
+		`{"Type":"container","Action":"die","Actor":{"Attributes":{"name":"gh-ars-X-runner","exitCode":"0"}},"timeNano":2}`,
+		"",
+	}, "\n")
+	rt := NewDocker(f, false, slog.New(slog.NewTextHandler(&logs, nil)))
+
+	evCh, errCh := rt.Events(context.Background(), "gh-ars.unit")
+	var got []Event
+	for ev := range evCh {
+		got = append(got, ev)
+	}
+	if len(got) != 1 || got[0].Action != ActionDie {
+		t.Fatalf("events = %+v, want die 1건", got)
+	}
+	err := <-errCh
+	if err == nil || !strings.Contains(err.Error(), "읽지 못한 줄 2개") {
+		t.Fatalf("종료 오류에 집계가 없다: %v", err)
+	}
+	if n := strings.Count(logs.String(), "읽지 못했다"); n != 1 {
+		t.Fatalf("경고 %d회, want 1 (첫 줄만 즉시, 나머지는 집계)", n)
 	}
 }
 

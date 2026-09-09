@@ -102,7 +102,7 @@ func (podmanFlavor) parseEvent(line []byte) (Event, bool, error) {
 	}
 	action := e.Status
 	if action == podmanStatusDied {
-		action = "die"
+		action = ActionDie
 	}
 	at := e.Time.Time
 	if e.TimeNano != 0 {

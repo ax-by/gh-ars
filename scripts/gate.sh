@@ -12,7 +12,7 @@
 # Usage:
 #   ./scripts/gate.sh --phase 3 --packages "internal/plan" --spec "S7.2-3, S8.1-8.3" --design "S5" --base HEAD
 #   ./scripts/gate.sh --phase 3 --packages "internal/plan" --spec "S8" --design "S5" --test-only
-#   ./scripts/gate.sh --phase 3 ... --reviewer claude    # Claude Code (opus 5, high) 로 리뷰
+#   ./scripts/gate.sh --phase 3 ... --reviewer claude    # Claude Code (opus 5, medium) 로 리뷰
 #   ./scripts/gate.sh --phase 3 ... --review-from-file .codex-review/last.md   # re-parse a saved review
 #
 # Reviewer: --reviewer codex|claude (default codex, or $GH_ARS_REVIEWER). Both render the same prompt
@@ -56,7 +56,7 @@ done
 GO_SH="$SCRIPT_DIR/go.sh"
 case "$REVIEWER" in
     codex)  REVIEW_SH="$SCRIPT_DIR/codex-review.sh";  REVIEW_LABEL="codex review (gpt-6-astra, medium)" ;;
-    claude) REVIEW_SH="$SCRIPT_DIR/claude-review.sh"; REVIEW_LABEL="claude review (opus 5, high)" ;;
+    claude) REVIEW_SH="$SCRIPT_DIR/claude-review.sh"; REVIEW_LABEL="claude review (opus 5, medium)" ;;
     *) echo "gate: unknown --reviewer: $REVIEWER (codex|claude)" >&2; exit 1 ;;
 esac
 

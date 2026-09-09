@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a Claude Code (opus 5, high effort) read-only code review against docs/SPEC.md and docs/DESIGN.md.
+# Run a Claude Code (opus 5, medium effort) read-only code review against docs/SPEC.md and docs/DESIGN.md.
 # Same contract as codex-review.sh: same prompt template (docs/review/PROMPT.md), same arguments,
 # same output shape ("## Verdict" + findings), so gate.sh can consume either reviewer.
 #
@@ -21,7 +21,7 @@ SPEC=""
 DESIGN=""
 BASE="none"
 MODEL="claude-opus-5"
-EFFORT="high"
+EFFORT="medium"   # high 는 패키지 하나에 12~15분이라 루프가 느려진다. 필요하면 --effort high
 TIMEOUT=$((45 * 60))
 
 while [ $# -gt 0 ]; do

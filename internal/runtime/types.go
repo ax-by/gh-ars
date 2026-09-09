@@ -31,6 +31,10 @@ type Container struct {
 	Created time.Time
 }
 
+// ActionDie 는 컨테이너 종료를 뜻하는 공통 어휘다. docker 는 이 값을 그대로 내고 podman 은
+// "died" 를 이것으로 정규화한다(podman.go). controller 는 이 값으로만 분기한다. [§4.2, §7.2-5]
+const ActionDie = "die"
+
 // Event 는 events 스트림 한 건이다. unit/role 은 호출자가 Name 에서 파싱한다. [§4.2]
 type Event struct {
 	Name     string // 컨테이너 이름 → unit/role 파싱 [§4.2]

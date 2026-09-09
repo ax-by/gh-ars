@@ -40,9 +40,11 @@ type flavor interface {
 	// eventsFormat 은 `events --format` 값이다. docker 는 `{{json .}}`, podman 은 `json`
 	// 리터럴이다(§5, TESTPLAN (runtime/podman)).
 	eventsFormat() string
-	// parseEvent 는 세 갈래다: 우리 이벤트(ok=true), 관심 없는 줄(ok=false, err=nil),
-	// 읽지 못한 줄(err != nil). 셋을 구분하는 이유는 스키마가 어긋났을 때(버전 차이) 모든 줄이
-	// 조용히 버려지면 die 가 영영 오지 않는데 아무 신호도 남지 않기 때문이다. [§7.2-5]
+	// parseEvent 는 우리 이벤트(ok=true)와 읽지 못한 줄(err != nil)을 구분한다. 구독이
+	// `--filter type=container` 로 좁혀져 있어 지금은 "관심 없는 줄"(ok=false, err=nil)이
+	// 생기지 않는다 — 다른 type 이나 이름 없는 줄이 오면 그 자체가 스키마 어긋남이다. 구분이
+	// 필요한 이유는 스키마가 어긋났을 때 모든 줄이 조용히 버려지면 die 가 영영 오지 않는데
+	// 아무 신호도 남지 않기 때문이다. 필터가 없어지면 ok=false 갈래가 다시 살아난다. [§7.2-5, §4.2]
 	parseEvent(line []byte) (ev Event, ok bool, err error)
 	parseInfo(out []byte) (Info, error)
 	isNotFound(stderr string) bool

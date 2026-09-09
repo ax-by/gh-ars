@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Run a Claude Code (opus 5, high effort) read-only code review against docs/SPEC.md and docs/DESIGN.md.
+  Run a Claude Code (opus 5, medium effort) read-only code review against docs/SPEC.md and docs/DESIGN.md.
 
 .DESCRIPTION
   Same contract as codex-review.ps1: same prompt template (docs/review/PROMPT.md), same parameters,
@@ -23,7 +23,8 @@ param(
     [Parameter(Mandatory)] [string] $Design,
     [string] $Base = "none",
     [string] $Model = "claude-opus-5",
-    [ValidateSet("low","medium","high","xhigh","max")] [string] $Effort = "high",
+    # high 는 패키지 하나에 12~15분이라 루프가 느려진다. 필요하면 -Effort high.
+    [ValidateSet("low","medium","high","xhigh","max")] [string] $Effort = "medium",
     [int] $TimeoutSeconds = (45 * 60)
 )
 

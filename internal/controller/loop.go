@@ -158,7 +158,7 @@ func (c *Controller) createUnits(ss *scaleSetState, n int) {
 
 // handleEvent 는 runner 컨테이너의 die 를 Dying 으로 보내고 정리를 띄운다. [§7.2-5, §8.3]
 func (c *Controller) handleEvent(m msgEvent) {
-	if m.Ev.Action != "die" {
+	if m.Ev.Action != runtime.ActionDie {
 		return
 	}
 	id, role, ok := domain.ParseContainerName(m.Ev.Name)

@@ -19,7 +19,7 @@
 .EXAMPLE
   .\scripts\gate.ps1 -Phase 3 -Packages "internal/plan" -Spec "S7.2-3, S8.1-8.3" -Design "S5" -Base HEAD
   .\scripts\gate.ps1 -Phase 3 -Packages "internal/plan" -Spec "S8" -Design "S5" -TestOnly
-  .\scripts\gate.ps1 -Phase 3 ... -Reviewer claude   # Claude Code (opus 5, high) 로 리뷰
+  .\scripts\gate.ps1 -Phase 3 ... -Reviewer claude   # Claude Code (opus 5, medium) 로 리뷰
   .\scripts\gate.ps1 -Phase 3 ... -ReviewFromFile .codex-review\last.md   # re-parse a saved review (no review call)
 
   Reviewer: -Reviewer codex|claude (default codex, or $env:GH_ARS_REVIEWER). Both render the same
@@ -47,7 +47,7 @@ Set-Location $repo
 $goPs1 = Join-Path $PSScriptRoot "go.ps1"
 if ($Reviewer -eq "claude") {
     $reviewPs1 = Join-Path $PSScriptRoot "claude-review.ps1"
-    $reviewLabel = "claude review (opus 5, high)"
+    $reviewLabel = "claude review (opus 5, medium)"
 } else {
     $reviewPs1 = Join-Path $PSScriptRoot "codex-review.ps1"
     $reviewLabel = "codex review (gpt-6-astra, medium)"
