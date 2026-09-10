@@ -60,6 +60,10 @@ type (
 		Found    bool
 		RunnerID int64 // Found 일 때. 입양 unit 의 id 를 여기서 처음 안다
 		Err      error
+		// ScaleSet·RunnerName 은 unit 이 그 사이 정리됐어도(u == nil) id 를 pendingCompletion·
+		// completedIDs 대조에 쓸 수 있게 함께 싣는다. msgUnitStarted 와 같은 이유다. [§7.2-3, DESIGN §4.5]
+		ScaleSet   string
+		RunnerName string
 	}
 	msgSessionStarted struct{ ScaleSet string } // 메시지 세션 (재)시작 → pendingCompletion 비움 [§7.2-3 안전장치 1]
 	// msgCheckPassDone 은 등록 대조 회차 하나가 끝났다는 통지다. 다음 tick 이 새 회차를 띄울 수
@@ -476,15 +480,20 @@ func (c *Controller) handleTick() {
 func (c *Controller) handleRegistration(m msgRegistration) {
 	delete(c.checking, m.Unit)
 	u := c.units[m.Unit]
+	// **id 학습은 어떤 조기 반환보다도 앞이다.** 입양 unit 은 GenerateJIT 결과가 없어 이 응답이
+	// 유일한 id 출처인데, 대조가 도는 사이 그 unit 이 정리되면(u == nil) 판정 분기 뒤에 둔 학습은
+	// 통째로 버려진다. 그러면 이름 없는 JobCompleted 와 대조할 id 가 없어 pendingCompletion 항목이
+	// 만료(5분)까지 남고 그동안 1개 과소 배치가 된다. learnRunnerID 는 u == nil 도 다룬다
+	// (이름 키로 항목을 backfill 하고 completedIDs 를 즉시 대조한다). [§7.2-3, DESIGN §4.5]
+	if m.Found && m.RunnerID != 0 {
+		c.learnRunnerID(m.ScaleSet, m.RunnerName, u, m.RunnerID)
+	}
 	if u == nil {
 		return
 	}
 	if m.Err != nil {
 		c.log.Warn("registration check failed", "unit", u.ID, "runner", u.RunnerName, "err", m.Err)
 		return
-	}
-	if m.Found {
-		c.learnRunnerID(u.ScaleSet, u.RunnerName, u, m.RunnerID)
 	}
 	switch u.State {
 	case domain.StateStarting:

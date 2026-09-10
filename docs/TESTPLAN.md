@@ -50,6 +50,7 @@
 - (controller/core) die 후 신규 생성 없음(minRunners 보충만), Creating 중 die, startUnit 실패 역순 정리 (§7.2-5).
 - (controller/ext) R24의 도달/미도달 분기 (시작 시 1회).
 - (controller/ext) 축소: `msgDesired`에서만, `RemoveRunner` 거절 시 Running 복귀, Draining 중 die → Dying, Draining은 tick 대조 제외 (§7.2-3).
+- (controller/ext) 늦은 등록 대조 결과의 runner id 학습: 입양 busy unit이 die → 정리 완료 뒤에 도착한 `msgRegistration`도 id를 배워 `pendingCompletion` 항목을 backfill하고, 이름 없는 `JobCompleted`가 앞서 왔든 뒤에 왔든 만료를 기다리지 않고 항목이 제거된다 (§7.2-3, DESIGN §4.5).
 - (controller/ext) `pendingCompletion` 보정: busy unit die → 캐시 값 `msgDesired`에서 생성 없음, `JobCompleted`가 die보다 먼저·나중 어느 쪽이든 항목이 남지 않음, 같은 메시지의 `JobCompleted`+`JobAvailable`(값 동일)에서 생성됨, 세션 재시작·재동기화·5분 만료로 비워짐 (§7.2-3).
 - (controller/ext) 재동기화의 순서: `pendingCompletion` 비우기가 `Reconcile` 적용보다 **앞**이다. 단절 중 죽은 busy·미완료 unit이 그 재동기화에서 Dying이 되면 `markDying`이 넣은 항목이 처리 후에도 남고, 단절 전에 쌓인 낡은 항목은 비워진다 (§7.2-3, DESIGN §4.5·§6).
 - (controller/ext) `msgResynced` → `plan.Reconcile` 결과 적용: 입양(Starting 진입), RemoveUnit, RemoveOrphan (§8.3, DESIGN §5 경계).

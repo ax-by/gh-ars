@@ -152,6 +152,7 @@ func (c *Controller) checkRegistrations(units []domain.Unit) {
 		ctx, cancel := context.WithTimeout(c.ctx, tickInterval)
 		ref, found, err := c.gh.GetRunner(ctx, u.RunnerName)
 		cancel()
-		c.send(msgRegistration{Unit: u.ID, Found: found, RunnerID: ref.ID, Err: err})
+		c.send(msgRegistration{Unit: u.ID, Found: found, RunnerID: ref.ID, Err: err,
+			ScaleSet: u.ScaleSet, RunnerName: u.RunnerName})
 	}
 }

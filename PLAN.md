@@ -124,5 +124,5 @@ Mac(개발 머신) 위에서 SSH 머신(localhost, Docker Desktop)과 podman 머
 
 구현 시 기본값으로 정하기로 한 항목(URL 판별 규칙, `${file:}` 공백 제거, 다이제스트 참조 허용, `RunnerSetting{Ephemeral, DisableUpdate}`, 세션 owner 문자열)은 코드 주석에 근거를 남긴다. 완료한 결정은 이 목록에서 지운다(근거는 `docs/DECISIONS.md`).
 
-- 입양 unit 의 늦은 등록 대조 결과(`msgRegistration`)가 정리 완료 뒤에 오면 그 runner id 를 버린다(`handleRegistration` 의 `u == nil` 조기 반환). busy 로 죽은 입양 unit 의 `pendingCompletion` 항목이 이름 없는 `JobCompleted` 와 대조되지 못해 최대 5분(만료)까지 남고, 그동안 1개 과소 배치가 된다. Phase 11 의 `pendingCompletion` 보정 항목에서 함께 처리한다(§7.2-3, DESIGN §4.5. Phase 10 리뷰 지적).
+- (Phase 11) 입양 unit 의 runner id 를 컨테이너 라벨(`gh-ars.runner-id`)로 박아 둘지. `GenerateJIT` 가 `create` 보다 앞이라 생성 시점에 id 를 이미 알고, 라벨 파싱 경로는 unit/role 용으로 이미 있다. 그러면 입양 unit 의 id 출처가 §8.3 등록 대조 하나뿐인 상태가 해소되고 GitHub 호출도 하나 줄어든다. 라벨 세트 변경이라 SPEC §4.3 개정이 필요하고, 구버전이 만든 컨테이너에는 라벨이 없으므로 부재는 "모름"으로 보고 기존 대조로 폴백한다(그 경로가 남으므로 `handleRegistration` 의 늦은 id 학습은 여전히 필요하다). `pendingCompletion` 보정 작업에서 함께 평가한다.
 - 늦은 `JobStarted`(die가 먼저 와 이미 정리된 unit)는 DESIGN §6 대로 로그만 남긴다. Phase 7 리뷰어 가설: 아주 짧은 job에서 캐시 통계로 불필요한 unit 1개가 뜰 수 있다. Phase 11 축소에서 회수되는지 확인한 뒤 닫는다.

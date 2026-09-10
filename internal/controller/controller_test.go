@@ -1058,3 +1058,54 @@ func TestRun_S7_1_4_NoWaitForUnreachedMachine(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestRegistration_S7_2_3_LateIDBackfillsPending: 입양 busy unit 이 죽고 정리까지 끝난 뒤 도착한
+// 등록 대조 결과라도 그 runner id 는 배운다. 입양 unit 은 GenerateJIT 결과가 없어 이 응답이 유일한
+// id 출처이고, 버리면 이름 없는 JobCompleted 와 대조할 수단이 사라져 pendingCompletion 항목이
+// 만료(5분)까지 남아 1개 과소 배치가 된다. 두 도착 순서 모두 만료를 기다리지 않아야 한다.
+// [§7.2-3, DESIGN §4.5]
+func TestRegistration_S7_2_3_LateIDBackfillsPending(t *testing.T) {
+	const runnerID = int64(4242)
+
+	// (가) 대조 결과가 먼저, 이름 없는 JobCompleted 가 나중.
+	h := newHarness(t, 0)
+	u := h.addUnit(domain.StateRunning, func(u *domain.Unit) { u.Busy = true; u.Adopted = true })
+	ss := h.c.scaleSets[testScaleSet]
+	name := u.RunnerName
+	h.c.handle(msgEvent{Machine: testMachine, Ev: runtime.Event{Name: domain.ContainerName(u.ID, domain.RoleRunner), Action: "die"}})
+	h.pumpUntil(isCleanupOf(u.ID))
+	if _, ok := h.c.units[u.ID]; ok {
+		t.Fatal("정리가 끝나지 않았다")
+	}
+	if e, ok := ss.pending[name]; !ok || e.RunnerID != 0 {
+		t.Fatalf("pending %+v, want 항목 있음 + RunnerID 0 (아직 모른다)", ss.pending)
+	}
+	h.c.handle(msgRegistration{Unit: u.ID, Found: true, RunnerID: runnerID, ScaleSet: testScaleSet, RunnerName: name})
+	if e := ss.pending[name]; e.RunnerID != runnerID {
+		t.Fatalf("늦은 대조 결과의 runner id 를 버렸다: %+v", ss.pending)
+	}
+	h.c.handle(msgJobCompleted{ScaleSet: testScaleSet, RunnerID: runnerID}) // 이름 없는 콜백
+	if _, ok := ss.pending[name]; ok {
+		t.Fatalf("JobCompleted 로 항목이 빠지지 않았다(만료를 기다리게 된다): %+v", ss.pending)
+	}
+
+	// (나) 반대 순서: 이름 없는 JobCompleted 가 먼저 도착해 completedIDs 에 보관되고, 늦은 대조
+	// 결과가 id 를 배우는 순간 즉시 대조된다.
+	h2 := newHarness(t, 0)
+	u2 := h2.addUnit(domain.StateRunning, func(u *domain.Unit) { u.Busy = true; u.Adopted = true })
+	ss2 := h2.c.scaleSets[testScaleSet]
+	name2 := u2.RunnerName
+	h2.c.handle(msgEvent{Machine: testMachine, Ev: runtime.Event{Name: domain.ContainerName(u2.ID, domain.RoleRunner), Action: "die"}})
+	h2.pumpUntil(isCleanupOf(u2.ID))
+	h2.c.handle(msgJobCompleted{ScaleSet: testScaleSet, RunnerID: runnerID})
+	if _, ok := ss2.completedIDs[runnerID]; !ok {
+		t.Fatalf("이름 없는 JobCompleted 가 보관되지 않았다: %+v", ss2.completedIDs)
+	}
+	h2.c.handle(msgRegistration{Unit: u2.ID, Found: true, RunnerID: runnerID, ScaleSet: testScaleSet, RunnerName: name2})
+	if _, ok := ss2.pending[name2]; ok {
+		t.Fatalf("id 를 배운 뒤에도 항목이 남았다: %+v", ss2.pending)
+	}
+	if _, ok := ss2.completedIDs[runnerID]; ok {
+		t.Fatalf("대조된 completedIDs 항목이 남았다: %+v", ss2.completedIDs)
+	}
+}
