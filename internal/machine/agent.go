@@ -100,9 +100,10 @@ const (
 	// probeTimeout 은 즉시 끝나야 하는 확인 명령(`id -u`, `info`, `ps`, `volume ls`)과 events
 	// 스트림 **열기** 의 상한이다. 스트림 유지에는 걸지 않는다. [§8.3 "preflight·관측 probe 상한"]
 	probeTimeout = 30 * time.Second
-	// pullTimeout 은 이미지 pull 1개의 상한이다. 이미지 크기에 비례하므로 probe 보다 길지만,
-	// preflight 는 첫 통지보다 앞이라 이 값이 곧 응답 없는 pull 이 세션 시작을 막는 최악의 시간이다.
-	// [§7.1-4, §8.3 "pre-pull 상한"]
+	// pullTimeout 은 **머신 하나의 pre-pull 단계 전체**의 상한이다(이미지 여러 개를 받아도 합쳐서
+	// 이 값이다 — 같은 머신의 이미지들은 어차피 같은 대역폭을 나눠 쓴다). 이미지 크기에 비례하므로
+	// probe 보다 길지만, preflight 는 첫 통지보다 앞이고 머신별로 병렬이라(§7.1-3) 이 값이 곧 응답
+	// 없는 pull 이 세션 시작을 막는 최악의 시간이다. [§7.1-4, §8.3 "pre-pull 상한"]
 	pullTimeout = 5 * time.Minute
 )
 
@@ -201,14 +202,18 @@ func (a *Agent) Preflight(ctx context.Context) (runtime.Info, error) {
 // 캐시된 이미지가 곧 그 이미지다. 이 완화가 없으면 레지스트리 장애 하나가 멀쩡한 머신을 unhealthy 에
 // 가둔다(이미지 부재와 같은 결과가 된다). [§7.1-4, R13]
 func (a *Agent) prePull(ctx context.Context, c *conn) error {
+	// 상한은 단계 전체에 한 번 건다. [§8.3 "pre-pull 상한"]
+	pctx, pcancel := context.WithTimeout(ctx, pullTimeout)
+	defer pcancel()
 	for _, img := range a.spec.Images {
-		pctx, pcancel := context.WithTimeout(ctx, pullTimeout)
 		err := c.rt.Pull(pctx, img)
-		pcancel()
 		if err == nil {
 			a.log.Info("image pulled", "image", img)
 			continue
 		}
+		// 로컬 이미지 확인은 상한 ctx 가 아니라 **부모 ctx** 로 돈다: 상한 초과로 pctx 가 만료된
+		// 뒤에 그것으로 확인하면 위 완화가 정확히 필요한 순간(레지스트리가 응답하지 않아 상한에
+		// 걸린 순간)에 무력해진다. [§7.1-4]
 		ictx, icancel := context.WithTimeout(ctx, probeTimeout) // 확인 명령 1회당 상한 [§8.3]
 		ok, exErr := c.rt.ImageExists(ictx, img)
 		icancel()

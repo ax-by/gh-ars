@@ -142,8 +142,12 @@ func (c *Controller) cleanupParts(ctx context.Context, u domain.Unit, rt runtime
 	return nil
 }
 
-// checkRegistrations 는 goroutine 이다. tick 이 고른 unit 마다 GetRunner 로 등록을 대조한다. [§8.3]
+// checkRegistrations 는 goroutine 이다. tick 이 고른 unit 마다 GetRunner 로 등록을 대조한다.
+// 호출은 순차다: scaleset.Client 가 Actions 서비스 호출을 인스턴스 하나짜리 뮤텍스로 직렬화하므로
+// 흩어도 벽시계 시간이 줄지 않고, 뮤텍스를 더 오래 물어 주 경로(JIT 생성, RemoveRunner)만 민다.
+// 끝나면 회차 종료를 알린다 — 다음 tick 은 그때까지 새 회차를 띄우지 않는다. [§8.3, DESIGN §4.4]
 func (c *Controller) checkRegistrations(units []domain.Unit) {
+	defer c.send(msgCheckPassDone{})
 	for _, u := range units {
 		ctx, cancel := context.WithTimeout(c.ctx, tickInterval)
 		ref, found, err := c.gh.GetRunner(ctx, u.RunnerName)

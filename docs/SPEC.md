@@ -49,6 +49,8 @@
 - job별 리소스 조정
 - 가짜 Scale Set 서버, 자동화된 통합 테스트, 메트릭/웹 UI
 - 타임아웃·grace 상수의 설정 노출 (§8.3 상수 표의 값들은 코드 상수. 노출은 후속 과제)
+- pre-pull의 머신 동시성 상한 (§7.1-3의 머신별 병렬은 MVP 규모에서 레지스트리 rate limit에 닿지 않는다고 본다. 머신 수가 늘어 동시 pull이 걸리기 시작하면 상한이 필요하다. 후속 과제)
+- 등록 대조를 단건 조회에서 목록 조회로 바꾸기 (§8.3은 `GetRunnerByName` 단건 조회를 규정한다. unit 수만큼 호출이 늘어 지연과 호출량이 함께 커지는데, 목록 조회 한 번이면 둘 다 해결된다. 근거: 라이브러리의 `GetRunnerByName`은 이미 `?agentName=` 필터가 붙은 목록 엔드포인트를 호출해 `RunnerReferenceList`를 받는다 — 필터 없는 호출로 scale set 전체를 한 번에 받을 수 있으나 라이브러리가 그 메서드를 노출하지 않는다. 후속 과제)
 - pre-pull의 무진행(idle) 감지 (MVP는 §8.3의 pre-pull 상한 하나로 막는다. 정상적으로 느린 pull을 살리면서 응답 없는 pull만 끊으려면 총량이 아니라 "출력이 60s 이상 없으면 중단"이 맞다. 후속 과제)
 
 ## 4. 핵심 개념
@@ -242,13 +244,13 @@ machines:
 ### 7.1 시작 (`gh-ars run -c config.yaml`)
 1. 설정 로드 → 치환 → 검증(R2~R15, R17~R20, R23~R25 중 정적 규칙).
 2. GitHub 인증 및 scope 확인.
-3. 각 머신 preflight:
+3. 각 머신 preflight (**머신별로 병렬**. 머신은 서로 독립이고, 순차로 돌면 pre-pull 상한이 "세션 시작을 막는 시간"을 묶는다는 목적을 달성하지 못한다. 결과 적용과 로그는 설정에 적힌 머신 순서로 한다):
    - SSH 머신: host key 검증 후 접속. local 머신: SSH·host key 단계 생략.
    - 설정된 runtime CLI 동작 확인(`docker info` / `podman info`, `--format '{{json .}}'` 한 번). runtime을 탐지하지는 않는다. 아래 항목들(예산 탐지, rootless, cgroup)은 모두 이 한 번의 결과에서 읽는다.
    - `machines[].resources` 생략 시 `info`로 CPU/메모리 자동 탐지, 명시 시 cap(R21). physicalMax·effectiveMax 계산(R22).
    - podman이면 같은 `info` 결과의 `host.security.rootless`로 rootless 확인. sidecar scale set이면 R16의 systemd/cgroup/권한(§10.2) 확인.
-   - 분류: 설정·환경 모순(R16, R21 오류)은 **시작 실패**. 도달 불가·명령 실패는 **unhealthy**로 표시하고 배치에서 제외(프로세스는 계속, 재접속 시 재시도). 재접속 후 preflight에서 R16/R21 위반이 드러나면 시작 실패 대신 그 머신을 **`Failed`**(영구 제외, 재접속 안 함)로 두고 오류 로그.
-4. 이미지 pre-pull: 각 healthy 머신에 `runner.image`를 pull. sidecar scale set이면 `jobRuntime.image`(또는 runtime별 기본 이미지)도 pull. 실패 머신은 unhealthy. 단 **pull이 실패해도 그 이미지가 그 머신에 이미 있으면 경고로 낮추고 성공으로 본다** — R13이 `:latest`·태그 없음을 막고 기본 태그도 릴리스마다 고정하므로 캐시된 이미지는 정확히 그 이미지다. 레지스트리 장애와 이미지 부재를 같은 결과로 만들지 않기 위해서다. pull 하나가 상한(§8.3)을 넘기면 실패로 본다 — preflight는 그 머신의 첫 통지(§7.1-7)보다 앞이므로, 상한이 없으면 응답 없는 pull 하나가 모든 scale set의 세션 시작(§7.1-9)을 무한정 막고 재접속 회차도 같은 자리에서 멈춰 그 머신이 unhealthy에 갇힌다.
+   - 분류: 설정·환경 모순(R16, R21 오류)은 **시작 실패**. 병렬이므로 첫 위반에서 즉시 멈추지 않고 **모든 머신의 판정을 끝낸 뒤 위반을 전부 로그로 보이고** 시작 실패한다(한 번 실행에 고칠 것을 다 보여준다). 도달 불가·명령 실패는 **unhealthy**로 표시하고 배치에서 제외(프로세스는 계속, 재접속 시 재시도). 재접속 후 preflight에서 R16/R21 위반이 드러나면 시작 실패 대신 그 머신을 **`Failed`**(영구 제외, 재접속 안 함)로 두고 오류 로그.
+4. 이미지 pre-pull: 각 healthy 머신에 `runner.image`를 pull. sidecar scale set이면 `jobRuntime.image`(또는 runtime별 기본 이미지)도 pull. 실패 머신은 unhealthy. 단 **pull이 실패해도 그 이미지가 그 머신에 이미 있으면 경고로 낮추고 성공으로 본다** — R13이 `:latest`·태그 없음을 막고 기본 태그도 릴리스마다 고정하므로 캐시된 이미지는 정확히 그 이미지다. 레지스트리 장애와 이미지 부재를 같은 결과로 만들지 않기 위해서다. 한 머신의 pre-pull 단계가 상한(§8.3)을 넘기면 실패로 본다 — preflight는 그 머신의 첫 통지(§7.1-7)보다 앞이므로, 상한이 없으면 응답 없는 pull 하나가 모든 scale set의 세션 시작(§7.1-9)을 무한정 막고 재접속 회차도 같은 자리에서 멈춰 그 머신이 unhealthy에 갇힌다. 시작 preflight에 실패한 머신은 세션 시작을 기다리게 하지 않는다(§7.1-9) — 그 머신은 이미 unhealthy라 배치 대상이 아닌데, 기다리면 그 머신의 재접속 첫 회차가 pre-pull을 다시 돌아 상한이 **두 번** 얹힌다. 상한을 넘겨 ctx가 만료된 뒤에도 **로컬 이미지 확인은 살아 있어야 한다** — 그 확인까지 만료된 ctx로 돌리면 위 완화가 정확히 필요한 순간(레지스트리가 응답하지 않아 상한에 걸린 순간)에 무력해진다.
 5. scale set 확보: `runnerGroup`을 `GetRunnerGroupByName`으로 조회 → 그 그룹 안에서 이름으로 `GetRunnerScaleSet(groupID, name)` → 없으면 `CreateRunnerScaleSet`. 그룹 이동 분기는 없다.[^group] **종료 시 삭제하지 않는다.**
 
 [^group]: 조회가 그룹 단위라 다른 그룹에 있는 동명 scale set은 발견되지 않으므로 "있으면 그룹 이동" 분기는 도달 불가다. 그룹 이동은 non-goal(§3.2). 다른 그룹의 동명 scale set과 이름이 충돌하면 GitHub이 생성을 거부하고 gh-ars는 시작 실패한다.
@@ -342,7 +344,7 @@ capacity가 `X-ScaleSetMaxCapacity`로 보고된다. 적용 방식: none은 컨�
 | runner 컨테이너 살아 있고 라벨의 scale set이 YAML에 없음 | 입양. 예산을 알 수 없으므로 **그 머신의 slot 1개로 센다.** 종료까지 관리하고 새로 띄우지 않음 |
 | runner 컨테이너 살아 있고 라벨의 machine 이름이 YAML과 다름 | 입양. 소속(배치·slot 계산)은 SSH로 도달한 현재 머신(또는 local). 단 GitHub 등록 이름은 등록 당시 이름이어야 `GetRunnerByName` 대조가 되므로 라벨의 `gh-ars.scaleSet`/`gh-ars.machine`으로 만든다(§4.3) |
 | runner 컨테이너 살아 있고 sidecar/볼륨/slice 일부 없음 | kill하지 않음. `die` 시 나머지 정리 |
-| runner 컨테이너 살아 있는데 GitHub에 등록이 없음 (`GetRunnerByName(<scaleSet>-<machine>-<unit>)` 단건 조회, tick 30s마다. **Starting과 Running에 적용, Draining은 제외**) | Starting: 생성 후 grace(5분) 이내면 대기(등록 전 정상 구간). 초과면 unit 정리. Running: grace 없이 즉시 unit 정리(job 종료 직후 등록이 먼저 사라지는 정상 구간이므로 `die`가 곧 뒤따른다). Draining: 축소로 등록을 지운 상태이므로 `die`를 기다린다 |
+| runner 컨테이너 살아 있는데 GitHub에 등록이 없음 (`GetRunnerByName(<scaleSet>-<machine>-<unit>)` 단건 조회, tick 30s 주기를 목표로. 지연될 수 있다 — 상수 표의 "상태 대조 tick" 참조. **Starting과 Running에 적용, Draining은 제외**) | Starting: 생성 후 grace(5분) 이내면 대기(등록 전 정상 구간). 초과면 unit 정리. Running: grace 없이 즉시 unit 정리(job 종료 직후 등록이 먼저 사라지는 정상 구간이므로 `die`가 곧 뒤따른다). Draining: 축소로 등록을 지운 상태이므로 `die`를 기다린다 |
 | Dying unit의 정리 명령 실패 | `Dying` 유지. 머신이 healthy면 매 tick(30s)마다 재시도(별도 백오프 없음). 머신이 unhealthy면 healthy 복귀 후 전체 동기화에서 정리. **부품이 남아 있는 동안 머신 slot을 계속 점유한 것으로 센다**(리소스가 실제로 잡혀 있고, 정리 실패가 과다 배치로 번지지 않게) |
 | runner 컨테이너가 `exited` 상태로 남아 있음 | unit 정리 |
 | runner 컨테이너 없는 sidecar/볼륨/slice (머신 내부 고아) | 항상 rm. 구현은 부품 집합을 runner 이름 없는 Dying unit으로 등록해 아래 정리 순서(GitHub 단계 생략)·tick 재시도·slot 점유를 그대로 따른다 |
@@ -360,14 +362,14 @@ unit id를 알 수 없는 고아 등록(GenerateJIT 직후·컨테이너 create 
 | 상수 | 값 | 용도 |
 |---|---|---|
 | grace | 5분 | 위 표의 등록 대기 |
-| 상태 대조 tick | 30s | `GetRunnerByName` 대조, grace·기동 타임아웃 판정 주기 |
+| 상태 대조 tick | 30s | grace·기동 타임아웃 판정 주기(이쪽은 로컬 계산이라 항상 이 주기다). `GetRunnerByName` 대조는 **목표 주기**다: unit 수 × GitHub 응답시간이 이 값을 넘으면 그만큼 늘어난다. 이 대조는 주 경로가 아니라 backstop이고(실제 정리는 `die` 이벤트와 기동 타임아웃 2분이 주도한다), 대조 호출은 라이브러리가 프로세스 하나짜리 뮤텍스로 직렬화하므로(DESIGN §4.4) 동시 호출로는 줄지 않는다. 한 회차가 다음 tick까지 끝나지 않으면 새 회차를 겹쳐 띄우지 않고 **이어서** 돌며 경고를 남긴다 — 겹쳐 띄우면 이미 끝난 앞부분만 다시 돌고 꼬리가 계속 밀린다 |
 | GitHub 큐 대기 | 24h | pending job이 큐에서 기다리는 상한(§7.2-3) |
 | 완료 보정 만료 | 5분 | `pendingCompletion` 항목 유지 상한(§7.2-3). tick에서 판정 |
 | SSH 접속 타임아웃 | 10s | 접속·재접속 시도 1회당(§7.1-8, §10.1) |
 | runner 기동 타임아웃 | 2분 | create→cp→start 완료까지(§7.2-4) |
 | 정리 회차 상한 | 2분 | unit 정리(또는 startUnit 되돌리기) 1회 시도의 상한. 초과면 실패로 보고 Dying 유지, 다음 tick(30s)에서 재시도 |
 | preflight·관측 probe 상한 | 30s | preflight의 확인 명령(`id -u`, `info`)과 전체 동기화의 관측(`ps`, `volume ls`), events 스트림 **열기** 1회당(스트림 유지에는 상한이 없다). 초과면 그 회차 실패 → 머신 unhealthy → 백오프 재시도(§7.1-3, §7.1-7, §7.1-8) |
-| pre-pull 상한 | 5분 | 이미지 pull 1개당(§7.1-4). 초과면 pull 실패 → 그 머신 unhealthy. 이 값이 곧 응답 없는 pull이 세션 시작을 막을 수 있는 최악의 시간이다 |
+| pre-pull 상한 | 5분 | **머신 하나의 pre-pull 단계 전체**(§7.1-4. 이미지 여러 개를 받아도 합쳐서 이 값이다 — 같은 머신의 이미지들은 어차피 같은 대역폭을 나눠 쓴다). 초과면 pull 실패 → 그 머신 unhealthy. preflight가 머신별 병렬(§7.1-3)이므로 이 값이 곧 응답 없는 pull이 세션 시작을 막을 수 있는 최악의 시간이다 |
 | SSH keepalive 주기 | 30s | 접속 하나당 생존 확인 주기(§10.1) |
 | SSH keepalive 허용 미스 | 3회 | 연속 실패가 이 수에 닿으면 단절로 보고 접속을 닫는다 → unhealthy → 재접속(§10.1). 응답이 오지 않는 프로브는 주기마다 1회 미스로 센다. 조용히 끊긴 접속을 걷어내는 최악의 시간은 `주기 × (미스 + 1)`(120s)다 — 첫 주기는 프로브를 보내는 데 쓰인다 |
 

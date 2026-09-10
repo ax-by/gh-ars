@@ -472,6 +472,10 @@ func isCleanupOf(id domain.UnitID) func(any) bool {
 }
 func isRegistration(m any) bool { _, ok := m.(msgRegistration); return ok }
 
+// isCheckPassDone 은 등록 대조 회차가 끝났다는 통지다. 회차의 모든 msgRegistration 뒤에 오므로,
+// 여기까지 펌프하면 그 회차의 판정이 전부 반영됐고 다음 tick 이 새 회차를 띄울 수 있다. [§8.3]
+func isCheckPassDone(m any) bool { _, ok := m.(msgCheckPassDone); return ok }
+
 func wantCalls(t *testing.T, got []string, want ...string) {
 	t.Helper()
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {

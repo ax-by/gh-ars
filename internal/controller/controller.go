@@ -120,9 +120,14 @@ type Controller struct {
 	budgets   map[string]resource.Budget
 	agents    map[string]MachineAgent
 	units     map[domain.UnitID]*domain.Unit
-	runnerIDs map[domain.UnitID]int64     // GenerateJIT 가 준 runner id. JobCompleted 의 RunnerID 대조용 [DESIGN §4.5]
-	cleaning  map[domain.UnitID]bool      // cleanupUnit goroutine 진행 중
-	checking  map[domain.UnitID]bool      // tick 의 GetRunner 대조 진행 중
+	runnerIDs map[domain.UnitID]int64 // GenerateJIT 가 준 runner id. JobCompleted 의 RunnerID 대조용 [DESIGN §4.5]
+	cleaning  map[domain.UnitID]bool  // cleanupUnit goroutine 진행 중
+	checking  map[domain.UnitID]bool  // tick 의 GetRunner 대조 진행 중
+	// checkPass 는 등록 대조 회차가 돌고 있는지다. 회차는 한 번에 하나만 돈다: 겹쳐 띄우면 다음
+	// tick 에 비어 있는 unit 이 정확히 방금 대조를 마친 앞부분이라 앞부분만 반복해 돌고 꼬리가
+	// 계속 밀린다(grace 를 넘긴 Starting 이 슬롯을 문 채 남는다). 흩어도 라이브러리 뮤텍스 때문에
+	// 벽시계 시간은 줄지 않는다. [§8.3 "상태 대조 tick", DESIGN §4.4, §6]
+	checkPass bool
 	startedAt map[domain.UnitID]time.Time // Creating → Starting 전이 시각. 그 전에 찍힌 스냅샷의 판정에서 제외 [§8.3 Creating 예외]
 	reached   map[string]bool             // 시작 시 preflight 도달 여부. R24 판정 [§6.2]
 	// r21Violated 는 재판정에서 예산이 unit 예산 아래로 떨어진 머신이다. 전이 시점 1회만
@@ -186,35 +191,65 @@ func (c *Controller) Run(ctx context.Context) error {
 		c.log.Warn(w)
 	}
 
-	// §7.1-2 GitHub 인증·scope 확인. preflight·pre-pull(머신 수 × 이미지당 최대 5분)보다 먼저 해서
+	// §7.1-2 GitHub 인증·scope 확인. preflight·pre-pull(머신당 최대 5분)보다 먼저 해서
 	// 잘못된 토큰이 그 시간을 다 쓴 뒤가 아니라 즉시 드러나게 한다.
 	if err := c.checkAuth(ctx); err != nil {
 		return err
 	}
 
 	// §7.1-3·4 preflight + pre-pull. 도달 불가·명령 실패는 unhealthy, 설정·환경 모순(R21)은 시작 실패.
+	// **머신별 병렬**이다: 머신은 서로 독립이고, 순차로 돌면 pre-pull 상한이 "세션 시작을 막는
+	// 시간"을 묶는다는 목적을 달성하지 못한다(머신 수만큼 곱해진다). [§7.1-3, §8.3 pre-pull 상한]
+	type preflightResult struct {
+		info runtime.Info
+		err  error
+	}
+	// 에이전트를 **전부 만든 뒤에** preflight 를 띄운다. 섞으면 NewAgent 실패로 중간에 돌아갈 때
+	// 이미 띄운 goroutine 이 results 에 계속 쓰고, 그 사이 성립한 접속은 closeAgents 가 아직 모른다.
 	for i := range c.machines {
 		m := &c.machines[i]
-		ss := c.scaleSets[m.ScaleSet]
-		agent, err := c.opts.NewAgent(c.agentSpec(*m, ss), c.log)
+		agent, err := c.opts.NewAgent(c.agentSpec(*m, c.scaleSets[m.ScaleSet]), c.log)
 		if err != nil {
 			return err
 		}
 		c.agents[m.Name] = agent
-		info, err := agent.Preflight(ctx)
-		if err != nil {
-			// 설정·환경 모순(R16, R21)은 시작 실패. 도달 불가·명령 실패는 unhealthy 로 두고 계속한다. [§7.1-3]
-			if errors.Is(err, machine.ErrFatal) {
-				return fmt.Errorf("machine %q preflight: %w", m.Name, err)
+	}
+	results := make([]preflightResult, len(c.machines))
+	var wg sync.WaitGroup
+	for i := range c.machines {
+		agent := c.agents[c.machines[i].Name]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i].info, results[i].err = agent.Preflight(ctx)
+		}()
+	}
+	wg.Wait()
+	// 결과 적용과 로그는 설정에 적힌 머신 순서로 한다: Controller 상태는 이 goroutine 만 만지고
+	// (DESIGN §1-2), 시작 로그도 실행마다 같은 순서여야 한다. 설정·환경 모순은 첫 건에서 멈추지
+	// 않고 전부 보인 뒤 함께 올린다 — 한 번 실행에 고칠 것을 다 보여준다. [§7.1-3]
+	var fatal []error
+	for i := range c.machines {
+		m := &c.machines[i]
+		r := results[i]
+		if r.err != nil {
+			if errors.Is(r.err, machine.ErrFatal) {
+				c.log.Error("machine preflight failed", "machine", m.Name, "err", r.err)
+				fatal = append(fatal, fmt.Errorf("machine %q preflight: %w", m.Name, r.err))
+				continue
 			}
-			c.log.Warn("machine unhealthy at start", "machine", m.Name, "err", err)
+			c.log.Warn("machine unhealthy at start", "machine", m.Name, "err", r.err)
 			continue
 		}
-		if err := c.applyInfoAtStart(m, info); err != nil {
-			return err
+		if err := c.applyInfoAtStart(m, r.info); err != nil {
+			fatal = append(fatal, err)
+			continue
 		}
 		c.reached[m.Name] = true
 		m.Health = domain.Healthy
+	}
+	if len(fatal) > 0 {
+		return errors.Join(fatal...)
 	}
 
 	// §7.1-5 scale set 확보. 종료 시 삭제하지 않는다.
@@ -307,9 +342,16 @@ func (c *Controller) closeAgents() {
 
 // awaitInitialSync 는 각 머신의 첫 Resynced/Unhealthy 가 올 때까지 inbox 를 처리한다. [§7.1-7, §7.1-8]
 func (c *Controller) awaitInitialSync(ctx context.Context) error {
+	// 시작 preflight 에 도달하지 못한 머신은 기다리지 않는다. 이미 unhealthy 라 배치·capacity 대상이
+	// 아니어서 기다릴 이유(첫 desired 로 만든 unit 의 die 수신)가 없는데, 기다리면 그 머신의 에이전트
+	// 첫 회차가 Preflight(접속 + pre-pull)를 다시 돌아 pre-pull 상한이 세션 시작 지연에 **두 번**
+	// 얹힌다 — §8.3 이 "세션 시작을 막을 수 있는 최악의 시간"이라고 규정한 값이 깨진다.
+	// 그 머신은 백오프 재접속에 성공하면 msgResynced 로 복귀한다. [§7.1-4, §7.1-7 → §7.1-9, §8.3]
 	waiting := map[string]bool{}
 	for _, m := range c.machines {
-		waiting[m.Name] = true
+		if c.reached[m.Name] {
+			waiting[m.Name] = true
+		}
 	}
 	for len(waiting) > 0 {
 		select {

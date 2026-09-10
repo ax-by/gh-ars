@@ -62,6 +62,9 @@ type (
 		Err      error
 	}
 	msgSessionStarted struct{ ScaleSet string } // 메시지 세션 (재)시작 → pendingCompletion 비움 [§7.2-3 안전장치 1]
+	// msgCheckPassDone 은 등록 대조 회차 하나가 끝났다는 통지다. 다음 tick 이 새 회차를 띄울 수
+	// 있게 한다(회차는 한 번에 하나다, §8.3 "상태 대조 tick").
+	msgCheckPassDone struct{}
 )
 
 // handle 은 루프 본체다. 메시지 하나를 처리한다. 테스트는 이것을 직접 부른다. [DESIGN §6]
@@ -90,6 +93,8 @@ func (c *Controller) handle(m any) {
 		c.handleCleanupDone(m)
 	case msgRegistration:
 		c.handleRegistration(m)
+	case msgCheckPassDone:
+		c.checkPass = false
 	case msgSessionStarted:
 		if ss := c.scaleSets[m.ScaleSet]; ss != nil {
 			clear(ss.pending)
@@ -264,6 +269,18 @@ func (c *Controller) handleResynced(m msgResynced) {
 			u.Parts = seen[u.ID]
 		}
 	}
+	// 이 머신 소속 unit 의 pendingCompletion 항목을 비운다. **Reconcile 적용보다 앞이다**:
+	// 비우기는 단절 구간에 쌓인 낡은 항목을 터는 안전망이고, Reconcile 의 markDying 이 넣는 항목은
+	// 방금 스냅샷으로 확인한 새 사실이다. 뒤에 비우면 낡은 것을 털다가 새 것을 같이 버려
+	// DESIGN §4.5 가 열거한 "재동기화" 갱신 지점이 죽은 조항이 되고, 실패 방향도 §7.2-3 이 규정한
+	// "일시적 과소 배치"에서 "유휴 runner 발생"으로 뒤집힌다. [§7.2-3 안전장치 1, DESIGN §4.5, §6]
+	for _, ss := range c.scaleSets {
+		for name, e := range ss.pending {
+			if e.Machine == m.Machine {
+				delete(ss.pending, name)
+			}
+		}
+	}
 	known := map[domain.UnitID]domain.Unit{}
 	for id, u := range c.units {
 		k := *u
@@ -329,14 +346,6 @@ func (c *Controller) handleResynced(m msgResynced) {
 		c.units[id] = u
 		c.log.Info("orphan parts found, removing", "unit", id, "machine", m.Machine, "parts", fmt.Sprintf("%+v", p))
 		c.startCleanup(u)
-	}
-	// 이 머신 소속 unit 의 pendingCompletion 항목을 비운다. [§7.2-3 안전장치 1]
-	for _, ss := range c.scaleSets {
-		for name, e := range ss.pending {
-			if e.Machine == m.Machine {
-				delete(ss.pending, name)
-			}
-		}
 	}
 	c.recomputeAll()
 }
@@ -420,7 +429,6 @@ func (c *Controller) handleTick() {
 		switch u.State {
 		case domain.StateStarting, domain.StateRunning:
 			if !c.checking[u.ID] {
-				c.checking[u.ID] = true
 				toCheck = append(toCheck, *u)
 			}
 		case domain.StateCreating:
@@ -433,7 +441,18 @@ func (c *Controller) handleTick() {
 			c.startCleanup(u)
 		}
 	}
-	if len(toCheck) > 0 {
+	// 등록 대조 회차는 한 번에 하나다. 앞 회차가 아직 돌고 있으면 새로 띄우지 않는다 — 그러면 그
+	// 회차가 멈춘 지점부터 이어서 돈다. 목표 주기(30s)를 넘긴 것은 경고로 남긴다: 실제 배포에서
+	// 언제 이 한계에 닿는지 알아야 목록 조회로 바꿀 시점을 잡는다(§3.2 후속 과제).
+	// [§8.3 "상태 대조 tick", DESIGN §4.4, §6]
+	switch {
+	case c.checkPass:
+		c.log.Warn("registration check pass still running at next tick", "pending", len(c.checking), "queued", len(toCheck))
+	case len(toCheck) > 0:
+		c.checkPass = true
+		for _, u := range toCheck {
+			c.checking[u.ID] = true
+		}
 		c.spawn(func() { c.checkRegistrations(toCheck) })
 	}
 	for _, ss := range c.scaleSets {

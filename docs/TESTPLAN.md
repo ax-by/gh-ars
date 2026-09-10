@@ -41,6 +41,9 @@
 - (machine) 취소 사유 규약: 여러 단계를 덮는 회차 ctx 를 마감 타이머가 취소하면 뒤따르는 단계의 `context canceled` 가 아니라 취소 사유를 보고한다. 사유 없는 취소(부모 ctx 종료)는 치환하지 않는다 (DESIGN §1-5, §7.1-8).
 - (machine) 재접속 백오프 수열(1s→2s→…→30s cap, jitter 범위, 성공 시 리셋) (§7.1-8).
 - (controller/core) 시작 순서: 인증 확인(§7.1-2)이 preflight·pre-pull보다 앞. 인증 실패면 pull·scale set 확보 없이 시작 실패.
+- (controller/core) 시작 preflight는 머신별 병렬이고, 결과 적용·로그는 설정 머신 순서다. 설정·환경 모순이 여러 머신에서 나오면 첫 건에서 멈추지 않고 전부 보고한 뒤 시작 실패 (§7.1-3).
+- (controller/core) 시작 preflight에 실패한 머신은 세션 시작을 기다리게 하지 않는다(그 머신의 첫 통지 없이도 세션이 열린다). 기다리면 그 머신의 첫 회차가 pre-pull을 다시 돌아 §8.3의 pre-pull 상한이 두 번 얹힌다 (§7.1-4, §7.1-9).
+- (controller/core) 등록 대조 회차는 한 번에 하나다: 도는 중의 tick은 새 회차를 띄우지 않고(unit 하나당 호출 1회) 경고만 남기며, 회차가 끝나면 다음 tick이 정상적으로 새 회차를 띄운다 (§8.3 "상태 대조 tick", DESIGN §4.4).
 - (controller/core) `msgDesired` → desired 계산 → spread → `startUnit`(create→cp→start) → `Starting`, `SetMaxRunners` 반영 (§7.2-1·3·4).
 - (controller/core) tick의 등록 대조: Starting 승격·grace 초과 Dying, Running 미등록 즉시 Dying (§8.3).
 - (controller/core) 정리 순서: GetRunner → RemoveRunner → 컨테이너 → sidecar → 볼륨 → slice, 각 단계 멱등 (§8.3).
@@ -48,6 +51,7 @@
 - (controller/ext) R24의 도달/미도달 분기 (시작 시 1회).
 - (controller/ext) 축소: `msgDesired`에서만, `RemoveRunner` 거절 시 Running 복귀, Draining 중 die → Dying, Draining은 tick 대조 제외 (§7.2-3).
 - (controller/ext) `pendingCompletion` 보정: busy unit die → 캐시 값 `msgDesired`에서 생성 없음, `JobCompleted`가 die보다 먼저·나중 어느 쪽이든 항목이 남지 않음, 같은 메시지의 `JobCompleted`+`JobAvailable`(값 동일)에서 생성됨, 세션 재시작·재동기화·5분 만료로 비워짐 (§7.2-3).
+- (controller/ext) 재동기화의 순서: `pendingCompletion` 비우기가 `Reconcile` 적용보다 **앞**이다. 단절 중 죽은 busy·미완료 unit이 그 재동기화에서 Dying이 되면 `markDying`이 넣은 항목이 처리 후에도 남고, 단절 전에 쌓인 낡은 항목은 비워진다 (§7.2-3, DESIGN §4.5·§6).
 - (controller/ext) `msgResynced` → `plan.Reconcile` 결과 적용: 입양(Starting 진입), RemoveUnit, RemoveOrphan (§8.3, DESIGN §5 경계).
 - (controller/ext) 재동기화 후 known unit의 `Parts`가 스냅샷과 일치하고 `State`·`Busy`는 보존된다: 캐시에 있던 부품이 스냅샷에 없으면 지워지고, 스냅샷에만 있으면 채워진다 (DESIGN §6 `msgResynced`).
 - (controller/ext) Dying unit의 slot 점유 유지와 tick 재시도, unhealthy 머신의 Dying 보류, `msgHealth`에 따른 capacity 재계산 (§8.3).
