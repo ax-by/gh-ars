@@ -280,14 +280,10 @@ func (c *Controller) handleResynced(m msgResynced) {
 	if mc != nil && mc.Health != domain.Failed { // Failed 머신은 복귀하지 않는다 [DESIGN §3.3]
 		// 예산 재계산이 먼저다: 시작 시 미도달이었던 머신은 physicalMax·effectiveMax 가 0 이라
 		// healthy 로만 돌려놓으면 capacity 에 한 칸도 보태지 못하고 배치에서도 계속 빠진다.
-		// 여기서 드러난 R21 위반은 §7.1-3 대로 그 머신만 Failed 로 만든다. [§7.1-3, §8.1, R21, R22]
+		// 여기서 드러난 R21 위반은 재판정이다: Failed 가 아니라 physicalMax 0 + 경고이고
+		// health 는 건드리지 않는다. 이 경로에 Failed 분기는 없다. [§7.1 재접속 회차, §8.1, R21, R22]
 		if m.Info.CPUs > 0 && m.Info.MemoryBytes > 0 { // info 를 담은 회차의 스냅샷만
-			if err := c.applyInfo(mc, m.Info); err != nil {
-				c.log.Error("machine failed, excluded permanently", "machine", m.Machine, "err", err)
-				mc.Health = domain.Failed
-				c.recomputeAll()
-				return
-			}
+			c.applyInfoOnResync(mc, m.Info)
 		}
 		if mc.Health != domain.Healthy {
 			c.log.Info("machine healthy", "machine", m.Machine)

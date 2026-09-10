@@ -113,7 +113,10 @@ func parsePSTime(value, layout string) (time.Time, error) {
 // "no such container"/"no such volume"을 포함한다. [§8.3]
 func containsNotFoundMsg(stderr string) bool {
 	s := strings.ToLower(stderr)
-	return strings.Contains(s, "no such container") || strings.Contains(s, "no such volume")
+	return strings.Contains(s, "no such container") || strings.Contains(s, "no such volume") ||
+		// 이미지 쪽은 ImageExists 가 쓴다(§7.1-4). docker 는 "No such image", podman 은
+		// "image not known" 이다.
+		strings.Contains(s, "no such image") || strings.Contains(s, "image not known")
 }
 
 // cli 는 docker/podman 공통 골격이다. argv 는 두 CLI 가 같고 파싱만 flavor 로 위임한다.
@@ -174,6 +177,21 @@ func (c *cli) Pull(ctx context.Context, image string) error {
 }
 
 // List 는 항상 `ps -a` 다. 종료된 컨테이너도 §8.3 판정 대상이다.
+// ImageExists 는 그 이미지가 이 머신에 이미 있는지다. pull 실패를 "레지스트리 장애"와
+// "이미지 부재"로 가르는 데 쓴다(§7.1-4). "이미 없음" 응답만 false 로 접고 나머지 실패는
+// 오류로 올린다 — 오류를 false 로 접으면 §7.1-4 의 완화가 통째로 무력해진다. [DESIGN §4.2]
+func (c *cli) ImageExists(ctx context.Context, image string) (bool, error) {
+	_, err := c.run(ctx, nil, "image", "inspect", image)
+	if err == nil {
+		return true, nil
+	}
+	var ee *ExitError
+	if errors.As(err, &ee) && c.f.isNotFound(ee.Stderr) {
+		return false, nil
+	}
+	return false, err
+}
+
 func (c *cli) List(ctx context.Context, labelFilter string) ([]Container, error) {
 	res, err := c.run(ctx, nil, "ps", "-a", "--filter", "label="+labelFilter, "--format", c.f.psFormat())
 	if err != nil {

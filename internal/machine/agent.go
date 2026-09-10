@@ -120,6 +120,14 @@ type Agent struct {
 	live bool
 	// fixed 는 NewWithRuntime 으로 만든 에이전트다: 접속·preflight 없이 주어진 Runtime 만 쓴다.
 	fixed bool
+	// verified 는 Spec.Verify(R21)가 이 머신에서 한 번이라도 통과했는지다. 위반의 등급이 여기서
+	// 갈린다: 최초 판정이면 ErrFatal, 이미 통과했던 머신의 재판정이면 경고다. [§7.1 재접속 회차, R21]
+	verified bool
+	// budgetViolated 는 마지막 판정이 위반이었는지다(전이 시점 1회만 Error 로 남기기 위해).
+	budgetViolated bool
+	// prePulled 는 pre-pull 이 한 번이라도 성공했는지다. 최초 접속 회차는 동기화 앞에서, 재접속
+	// 회차는 동기화 뒤에서 pull 한다. [§7.1-4, §7.1 재접속 회차]
+	prePulled bool
 	// podmanSudo 는 첫 preflight 가 고정한 podman 경로다(§10.2 규칙 3). 재접속에서는 다시 협상하지
 	// 않는다: 경로가 바뀌면 컨테이너 저장소가 통째로 달라져(rootless 저장소는 root 의 podman 에게
 	// 보이지 않는다) 이미 도는 unit 이 사라진 것처럼 보이고 재동기화가 그 부품을 지운다. [§10.2 규칙 3, §8.3]
@@ -178,19 +186,72 @@ func (a *Agent) Preflight(ctx context.Context) (runtime.Info, error) {
 	if err != nil {
 		return runtime.Info{}, err
 	}
-	for _, img := range a.spec.Images { // 6. pre-pull. 실패(상한 초과 포함) → unhealthy [§7.1-4]
-		pctx, pcancel := context.WithTimeout(ctx, pullTimeout)
-		err := c.rt.Pull(pctx, img)
-		pcancel()
-		if err != nil {
-			_ = c.ex.Close()
-			return runtime.Info{}, fmt.Errorf("pre-pull %s: %w", img, err)
-		}
-		a.log.Info("image pulled", "image", img)
+	if err := a.prePull(ctx, c); err != nil { // 6. 최초 접속 회차의 pre-pull 자리 [§7.1-4]
+		_ = c.ex.Close()
+		return runtime.Info{}, err
 	}
+	a.prePulled = true
 	a.replaceConn(c)
 	a.log.Info("machine connected", "runtime", a.spec.Runtime, "sudo", c.sudo, "root", c.root)
 	return info, nil
+}
+
+// prePull 은 §7.1-4 다. 실패(상한 초과 포함)는 unhealthy 지만, **그 이미지가 이미 머신에 있으면
+// 경고로 낮추고 성공으로 본다**: R13 이 `:latest`·태그 없음을 막고 기본 태그도 릴리스마다 고정하므로
+// 캐시된 이미지가 곧 그 이미지다. 이 완화가 없으면 레지스트리 장애 하나가 멀쩡한 머신을 unhealthy 에
+// 가둔다(이미지 부재와 같은 결과가 된다). [§7.1-4, R13]
+func (a *Agent) prePull(ctx context.Context, c *conn) error {
+	for _, img := range a.spec.Images {
+		pctx, pcancel := context.WithTimeout(ctx, pullTimeout)
+		err := c.rt.Pull(pctx, img)
+		pcancel()
+		if err == nil {
+			a.log.Info("image pulled", "image", img)
+			continue
+		}
+		ictx, icancel := context.WithTimeout(ctx, probeTimeout) // 확인 명령 1회당 상한 [§8.3]
+		ok, exErr := c.rt.ImageExists(ictx, img)
+		icancel()
+		if ok {
+			a.log.Warn("image pull failed, using the image already on the machine", "image", img, "err", err)
+			continue
+		}
+		if exErr != nil {
+			err = errors.Join(err, exErr)
+		}
+		return fmt.Errorf("pre-pull %s: %w", img, err)
+	}
+	return nil
+}
+
+// judgeBudget 은 그 회차의 info 로 R21 을 재판정한다(§7.1 "재접속 회차가 다시 도는 범위").
+// 위반의 등급은 재접속 여부가 아니라 **그 머신을 처음 판정하는가**로 갈린다:
+//   - 최초 판정에서 위반 → ErrFatal(시작 시 시작 실패, 시작 시 미도달이었으면 Failed).
+//   - 이미 통과했던 머신의 재판정에서 위반 → 오류가 아니다. 회차는 그대로 진행하고 Resynced 에
+//     그 info 를 실어 보낸다. Controller 의 applyInfo 가 physicalMax 0 을 계산해 반영하므로 배치는
+//     그것만으로 막히고, Unhealthy 로 내릴 때 따라오는 해악(Dying 정리 보류, die 수신 단절)이 없다.
+//
+// 로그는 전이 시점 1회만 Error, 이어지는 회차는 Debug 다(30s 마다 같은 오류를 찍지 않는다). [§7.1, R21]
+func (a *Agent) judgeBudget(info runtime.Info) error {
+	if a.spec.Verify == nil {
+		return nil
+	}
+	err := a.spec.Verify(info)
+	switch {
+	case err == nil:
+		if a.budgetViolated {
+			a.log.Info("machine budget recovered", "cpus", info.CPUs, "memoryBytes", info.MemoryBytes)
+		}
+		a.verified, a.budgetViolated = true, false
+	case !a.verified:
+		return fatalf("머신 %q: %s", a.name, err)
+	case !a.budgetViolated:
+		a.budgetViolated = true
+		a.log.Error("machine budget shrank below unit budget, placement blocked", "err", err)
+	default:
+		a.log.Debug("machine budget still below unit budget", "err", err)
+	}
+	return nil
 }
 
 // replaceConn 은 새 접속으로 교체하고 이전 접속을 닫는다.
@@ -310,8 +371,20 @@ func (r round) resetsBackoff() bool { return r.served && r.life >= BackoffMax }
 // life 는 events 스트림이 열려 있던 시간이다(회차 전체가 아니다: pre-pull 이 오래 걸린 회차가
 // 스트림 즉사에도 리셋 자격을 얻으면 안 된다). 백오프 리셋 판정은 round.resetsBackoff.
 func (a *Agent) serve(ctx context.Context, sink Sink) round {
+	// pre-pull 의 자리는 최초 접속인지로 갈린다: 최초 접속 회차는 동기화 앞(콜드 머신은 이미지가
+	// 실제로 없다), 이미 한 번 pull 에 성공했던 머신의 재접속 회차는 Resynced 뒤로 미룬다 —
+	// 재동기화와 die 수신이 레지스트리 가용성에 인질로 잡히면 안 된다. [§7.1 재접속 회차, §7.1-4]
+	var deferredPull *conn
 	if !a.live {
-		if _, err := a.Preflight(ctx); err != nil {
+		if a.prePulled {
+			c, _, err := a.connect(ctx)
+			if err != nil {
+				return round{err: err}
+			}
+			a.replaceConn(c)
+			a.log.Info("machine reconnected", "runtime", a.spec.Runtime, "sudo", c.sudo, "root", c.root)
+			deferredPull = c
+		} else if _, err := a.Preflight(ctx); err != nil {
 			return round{err: err}
 		}
 	}
@@ -337,19 +410,22 @@ func (a *Agent) serve(ctx context.Context, sink Sink) round {
 	icancel()
 	if err != nil {
 		cancel(nil)
-		drain(evCh, errCh)
 		// 열기 상한이 ectx 를 취소했으면 Info 도 "context canceled" 로 끝난다. 그것을 그대로
 		// 보고하면 데몬이 죽은 것처럼 보이므로 reported 가 실제 사유로 되돌린다.
-		return round{life: life(), err: reported(ectx, fmt.Errorf("info: %w", err))}
-	}
-	// 회차마다 그 회차의 info 로 예산을 다시 판정한다(R21). preflight 를 건너뛰는 회차(local 의
-	// events 재시작)에도 위반이 드러나면 Failed 가 되어 goroutine 이 끝나야 하기 때문이다. [§7.1-3, R21]
-	if a.spec.Verify != nil {
-		if err := a.spec.Verify(info); err != nil {
-			cancel(nil)
-			drain(evCh, errCh)
-			return round{life: life(), err: fatalf("머신 %q: %s", a.name, err)}
+		e := reported(ectx, fmt.Errorf("info: %w", err))
+		// events 열기도 함께 실패했으면 그 사유를 버리지 않는다(같은 회차의 원인이 둘이다).
+		// 우리가 방금 건 취소는 사유가 아니므로 뺀다.
+		if evErr := drain(evCh, errCh); evErr != nil && !errors.Is(evErr, context.Canceled) {
+			e = errors.Join(e, fmt.Errorf("events: %w", evErr))
 		}
+		return round{life: life(), err: e}
+	}
+	// 회차마다 그 회차의 info 로 예산을 다시 판정한다(R21): preflight 를 건너뛰는 회차(local 의
+	// events 재시작)에도 예산은 바뀔 수 있다. 위반의 등급은 judgeBudget 이 가른다. [§7.1, R21]
+	if err := a.judgeBudget(info); err != nil {
+		cancel(nil)
+		drain(evCh, errCh)
+		return round{life: life(), err: err}
 	}
 	snap, err := a.Observe(ectx)
 	if err != nil {
@@ -371,10 +447,37 @@ func (a *Agent) serve(ctx context.Context, sink Sink) round {
 	default:
 	}
 	sink.Resynced(a.name, snap)
-	for ev := range evCh {
-		sink.Event(a.name, ev)
+	// 미뤄 둔 pre-pull 은 이벤트 소비와 **나란히** 돈다. 순서만 미루고 동기로 돌리면 die 수신이
+	// 여전히 레지스트리에 묶인다(evCh 는 무버퍼라 Events goroutine 이 첫 이벤트에서 막힌다).
+	// 실패하면 스트림은 이미 열려 있고 동기화도 끝난 뒤이므로 "Resynced 를 보낸 회차의 실패"로
+	// 보고한다(Run 이 Unhealthy 를 보낸다). [§7.1 재접속 회차, §7.1-4]
+	var pullCh <-chan error
+	if deferredPull != nil {
+		ch := make(chan error, 1)
+		go func() { ch <- a.prePull(ectx, deferredPull) }()
+		pullCh = ch
 	}
-	return round{served: true, life: life(), err: <-errCh}
+	for {
+		select {
+		case ev, ok := <-evCh:
+			if !ok { // 스트림 종료 = 회차 종료. 남아 있는 pull 은 ectx 취소로 접는다
+				cancel(nil)
+				if pullCh != nil {
+					<-pullCh
+				}
+				return round{served: true, life: life(), err: <-errCh}
+			}
+			sink.Event(a.name, ev)
+		case err := <-pullCh:
+			pullCh = nil // nil 채널은 select 에서 영원히 막힌다 = 이 case 가 빠진다
+			if err != nil {
+				cancel(nil)
+				drain(evCh, errCh)
+				return round{served: true, life: life(), err: reported(ectx, err)}
+			}
+			a.prePulled = true
+		}
+	}
 }
 
 // errEventsOpenTimeout 은 events 열기 상한이 회차 ctx 를 취소한 사유다. [§8.3 "preflight·관측 probe 상한"]
@@ -402,11 +505,13 @@ func reported(ctx context.Context, err error) error {
 	return err
 }
 
-// drain 은 취소한 events 스트림을 끝까지 비운다(goroutine 누수 방지).
-func drain(evCh <-chan runtime.Event, errCh <-chan error) {
+// drain 은 취소한 events 스트림을 끝까지 비운다(goroutine 누수 방지). 스트림 종료 사유를
+// 돌려주므로 회차 실패 원인이 둘인 경우에 그것을 잃지 않는다(errCh 가 nil 이면 nil).
+func drain(evCh <-chan runtime.Event, errCh <-chan error) error {
 	for range evCh {
 	}
-	if errCh != nil {
-		<-errCh
+	if errCh == nil {
+		return nil
 	}
+	return <-errCh
 }

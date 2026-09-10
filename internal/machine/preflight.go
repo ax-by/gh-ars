@@ -62,10 +62,8 @@ func (a *Agent) connect(ctx context.Context) (*conn, runtime.Info, error) {
 			return nil, runtime.Info{}, err
 		}
 	}
-	if a.spec.Verify != nil { // 5. 머신 예산 판정(R21)은 설정을 아는 Controller 가 넘긴다 [§7.1-3, R21]
-		if err := a.spec.Verify(info); err != nil {
-			return nil, runtime.Info{}, fatalf("머신 %q: %s", a.name, err)
-		}
+	if err := a.judgeBudget(info); err != nil { // 5. 예산 판정(R21)은 설정을 아는 Controller 가 넘긴다 [§7.1-3, R21]
+		return nil, runtime.Info{}, err
 	}
 	ok = true
 	return &conn{ex: ex, rt: rt, sudo: sudo, root: root}, info, nil

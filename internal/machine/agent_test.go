@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,12 +19,18 @@ import (
 
 // fakeRT 는 Events 열기 실패를 흉내 내는 runtime.Runtime 대역이다.
 type fakeRT struct {
-	mu       sync.Mutex
-	eventsN  int
-	openErr  error
-	infoCall int
-	ord      []string // 호출 순서(events → info → 관측)
-	emit     string   // 비어 있지 않으면 events 를 연 직후 그 이름의 die 를 흘린다
+	mu        sync.Mutex
+	eventsN   int
+	openErr   error
+	infoCall  int
+	ord       []string // 호출 순서(events → info → 관측)
+	emit      string   // 비어 있지 않으면 events 를 연 직후 그 이름의 die 를 흘린다
+	endStream bool     // true 면 emit 뒤 스트림을 끝낸다(회차를 여러 번 돌리는 데 쓴다)
+	// pre-pull 대역. pullErr 가 있으면 ImageExists 로 §7.1-4 완화가 판정된다.
+	pullN          int
+	pullErr        error
+	imagePresent   bool
+	imageExistsErr error
 }
 
 func (f *fakeRT) rec(what string) {
@@ -45,7 +53,19 @@ func (f *fakeRT) Info(context.Context) (runtime.Info, error) {
 	f.infoCall++
 	return runtime.Info{CPUs: 1, MemoryBytes: 1 << 30}, nil
 }
-func (f *fakeRT) Pull(context.Context, string) error { return nil }
+func (f *fakeRT) Pull(context.Context, string) error {
+	f.rec("Pull")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pullN++
+	return f.pullErr
+}
+func (f *fakeRT) ImageExists(context.Context, string) (bool, error) {
+	f.rec("ImageExists")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.imagePresent, f.imageExistsErr
+}
 func (f *fakeRT) List(context.Context, string) ([]runtime.Container, error) {
 	f.rec("List")
 	return nil, nil
@@ -77,7 +97,7 @@ func (f *fakeRT) Events(ctx context.Context, _ string) (<-chan runtime.Event, <-
 		close(ev)
 		return ev, errCh
 	}
-	emit := f.emit
+	emit, end := f.emit, f.endStream
 	go func() {
 		// 열자마자 하나 흘린다: 관측 중에 난 die 도 스트림에 남아 있다가 소비 단계에서 전달돼야 한다.
 		if emit != "" {
@@ -85,6 +105,12 @@ func (f *fakeRT) Events(ctx context.Context, _ string) (<-chan runtime.Event, <-
 			case ev <- runtime.Event{Name: emit, Action: "die"}:
 			case <-ctx.Done():
 			}
+		}
+		if end {
+			close(ev)
+			errCh <- errors.New("events: 스트림 종료")
+			close(errCh)
+			return
 		}
 		<-ctx.Done()
 		close(ev)
@@ -187,7 +213,8 @@ func TestRun_S7_1_7_ResyncAfterEventsOpen(t *testing.T) {
 
 // TestRun_R21_VerifyOnPreflightSkippedRound: preflight 를 건너뛰는 회차 — local 머신의 events 재시작이
 // 이 모양이다 — 에도 그 회차의 info 로 예산을 다시 판정한다. NewWithRuntime 에이전트는 접속·preflight
-// 단계가 없어 그 회차를 그대로 재현한다. 위반이면 Resynced 없이 Failed 로 끝난다. [§7.1-3, R21]
+// 단계가 없어 그 회차를 그대로 재현한다. 여기서는 그 머신의 **최초** 판정이므로 위반이면 Resynced
+// 없이 Failed 로 끝난다(한 번 통과한 뒤의 재판정은 아래 RejudgeAfterPass). [§7.1-3, §7.1 재접속 회차, R21]
 func TestRun_R21_VerifyOnPreflightSkippedRound(t *testing.T) {
 	rt := &fakeRT{}
 	a := NewWithRuntime(Spec{Name: "m1", Local: true, Verify: func(info runtime.Info) error {
@@ -350,5 +377,57 @@ func TestServe_S7_1_8_OpenTimeoutReportsCause(t *testing.T) {
 	cancel2(nil)
 	if got := reported(ctx2, fmt.Errorf("info: %w", real)); !errors.Is(got, real) {
 		t.Fatalf("사유 없는 취소가 치환됐다: %v", got)
+	}
+}
+
+// TestRun_R21_RejudgeAfterPassIsNotFatal: 이미 한 번 R21 을 통과했던 머신의 재판정에서 위반이 나오면
+// (VM 축소·cgroup 제한 변경 같은 환경 변화) Failed 도 Unhealthy 도 아니다: 회차는 그대로 진행해
+// Resynced 에 그 info 를 실어 보내고, physicalMax 0 은 Controller 가 계산한다. Failed 로 두면 아직
+// job 을 돌리는 unit 의 die 수신과 Dying 정리까지 함께 끊긴다. [§7.1 재접속 회차, R21]
+func TestRun_R21_RejudgeAfterPassIsNotFatal(t *testing.T) {
+	rt := &fakeRT{emit: "gh-ars-u1-runner", endStream: true}
+	var n atomic.Int32
+	a := NewWithRuntime(Spec{Name: "m1", Local: true, Verify: func(runtime.Info) error {
+		if n.Add(1) == 1 {
+			return nil // 1회차만 통과 → 이후는 전부 재판정이다
+		}
+		return errors.New("R21 resources (cpu=1) < unit (cpu=2)")
+	}}, rt, nil)
+	sink := &recSink{}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	a.Run(ctx, sink)
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if sink.failed != 0 {
+		t.Fatalf("failed=%d, want 0 (재판정 위반은 Failed 가 아니다): %v", sink.failed, sink.failErr)
+	}
+	if sink.resynced < 2 {
+		t.Fatalf("resynced=%d, want ≥2 (위반 회차도 동기화까지 간다)", sink.resynced)
+	}
+	if n.Load() < 2 {
+		t.Fatalf("Verify 호출 %d회, want ≥2 (회차마다 재판정)", n.Load())
+	}
+}
+
+// TestPrePull_S7_1_4_LocalImageDowngradesFailure: pull 이 실패해도 그 이미지가 이미 머신에 있으면
+// 경고로 낮추고 성공으로 본다(R13 이 태그를 고정하므로 캐시된 이미지가 곧 그 이미지다). 이미지가
+// 없으면 그대로 실패다 — 레지스트리 장애와 이미지 부재를 가르는 것이 이 완화의 전부다. [§7.1-4, R13]
+func TestPrePull_S7_1_4_LocalImageDowngradesFailure(t *testing.T) {
+	pullErr := errors.New("failed to resolve reference: 503 Service Unavailable")
+	rt := &fakeRT{pullErr: pullErr, imagePresent: true}
+	a := &Agent{name: "m1", log: slog.Default(), spec: Spec{Images: []string{"img:1"}}}
+	if err := a.prePull(context.Background(), &conn{rt: rt}); err != nil {
+		t.Fatalf("이미 있는 이미지의 pull 실패가 회차를 죽였다: %v", err)
+	}
+
+	// prePulled(= 다음 회차가 pull 을 뒤로 미룰 자격)는 호출자가 세운다: 미뤄 둔 pull 은 goroutine
+	// 에서 돌기 때문에 여기서 세우면 Run goroutine 과 경합한다.
+	rt2 := &fakeRT{pullErr: pullErr, imagePresent: false}
+	a2 := &Agent{name: "m1", log: slog.Default(), spec: Spec{Images: []string{"img:1"}}}
+	err := a2.prePull(context.Background(), &conn{rt: rt2})
+	if err == nil || !errors.Is(err, pullErr) {
+		t.Fatalf("이미지가 없는데 성공했다: %v", err)
 	}
 }

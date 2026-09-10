@@ -159,6 +159,7 @@ func (f *fakeRT) Pull(_ context.Context, image string) error {
 	f.add("Pull %s", image)
 	return nil
 }
+func (f *fakeRT) ImageExists(context.Context, string) (bool, error)         { return true, nil }
 func (f *fakeRT) List(context.Context, string) ([]runtime.Container, error) { return nil, nil }
 func (f *fakeRT) Create(_ context.Context, spec runtime.CreateSpec) error {
 	f.add("Create %s", spec.Name)

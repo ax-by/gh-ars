@@ -236,3 +236,18 @@ func TestPodman_S7_2_5_DieWithoutExitCodeStillDelivered(t *testing.T) {
 		t.Fatalf("event = %+v", ev)
 	}
 }
+
+// [§7.1-4, §10.2 규칙 3] podman 도 같은 판정이며, 고정된 sudo 경로가 그대로 전파된다.
+func TestPodman_S7_1_4_ImageExists(t *testing.T) {
+	f, rt := newPodmanFake(t, true)
+	img := "quay.io/podman/stable:v5.8.4"
+	f.results = []executor.Result{{ExitCode: 125, Stderr: []byte("Error: " + img + ": image not known\n")}}
+	ok, err := rt.ImageExists(context.Background(), img)
+	if err != nil || ok {
+		t.Fatalf("ImageExists = %v, %v, want false, nil", ok, err)
+	}
+	c := f.last()
+	if !reflect.DeepEqual(c.Argv, []string{"podman", "image", "inspect", img}) || !c.Sudo {
+		t.Fatalf("argv = %v sudo=%v", c.Argv, c.Sudo)
+	}
+}

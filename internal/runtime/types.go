@@ -68,6 +68,9 @@ type Runtime interface {
 	Kind() domain.RuntimeKind
 	Info(ctx context.Context) (Info, error)
 	Pull(ctx context.Context, image string) error
+	// ImageExists 는 그 이미지가 이미 있는지다. pull 실패를 레지스트리 장애와 이미지 부재로
+	// 가르는 데 쓴다(§7.1-4). "이미 없음"만 false, 그 밖의 실패는 오류다. [DESIGN §4.2]
+	ImageExists(ctx context.Context, image string) (bool, error)
 	// List 는 항상 `ps -a` 다. labelFilter 는 "gh-ars.unit" 또는 "gh-ars.unit=<id>". [§4.2, §8.3]
 	List(ctx context.Context, labelFilter string) ([]Container, error)
 	Create(ctx context.Context, spec CreateSpec) error

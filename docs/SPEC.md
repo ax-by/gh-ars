@@ -248,7 +248,7 @@ machines:
    - `machines[].resources` 생략 시 `info`로 CPU/메모리 자동 탐지, 명시 시 cap(R21). physicalMax·effectiveMax 계산(R22).
    - podman이면 같은 `info` 결과의 `host.security.rootless`로 rootless 확인. sidecar scale set이면 R16의 systemd/cgroup/권한(§10.2) 확인.
    - 분류: 설정·환경 모순(R16, R21 오류)은 **시작 실패**. 도달 불가·명령 실패는 **unhealthy**로 표시하고 배치에서 제외(프로세스는 계속, 재접속 시 재시도). 재접속 후 preflight에서 R16/R21 위반이 드러나면 시작 실패 대신 그 머신을 **`Failed`**(영구 제외, 재접속 안 함)로 두고 오류 로그.
-4. 이미지 pre-pull: 각 healthy 머신에 `runner.image`를 pull. sidecar scale set이면 `jobRuntime.image`(또는 runtime별 기본 이미지)도 pull. 실패 머신은 unhealthy. pull 하나가 상한(§8.3)을 넘기면 실패로 본다 — preflight는 그 머신의 첫 통지(§7.1-7)보다 앞이므로, 상한이 없으면 응답 없는 pull 하나가 모든 scale set의 세션 시작(§7.1-9)을 무한정 막고 재접속 회차도 같은 자리에서 멈춰 그 머신이 unhealthy에 갇힌다.
+4. 이미지 pre-pull: 각 healthy 머신에 `runner.image`를 pull. sidecar scale set이면 `jobRuntime.image`(또는 runtime별 기본 이미지)도 pull. 실패 머신은 unhealthy. 단 **pull이 실패해도 그 이미지가 그 머신에 이미 있으면 경고로 낮추고 성공으로 본다** — R13이 `:latest`·태그 없음을 막고 기본 태그도 릴리스마다 고정하므로 캐시된 이미지는 정확히 그 이미지다. 레지스트리 장애와 이미지 부재를 같은 결과로 만들지 않기 위해서다. pull 하나가 상한(§8.3)을 넘기면 실패로 본다 — preflight는 그 머신의 첫 통지(§7.1-7)보다 앞이므로, 상한이 없으면 응답 없는 pull 하나가 모든 scale set의 세션 시작(§7.1-9)을 무한정 막고 재접속 회차도 같은 자리에서 멈춰 그 머신이 unhealthy에 갇힌다.
 5. scale set 확보: `runnerGroup`을 `GetRunnerGroupByName`으로 조회 → 그 그룹 안에서 이름으로 `GetRunnerScaleSet(groupID, name)` → 없으면 `CreateRunnerScaleSet`. 그룹 이동 분기는 없다.[^group] **종료 시 삭제하지 않는다.**
 
 [^group]: 조회가 그룹 단위라 다른 그룹에 있는 동명 scale set은 발견되지 않으므로 "있으면 그룹 이동" 분기는 도달 불가다. 그룹 이동은 non-goal(§3.2). 다른 그룹의 동명 scale set과 이름이 충돌하면 GitHub이 생성을 거부하고 gh-ars는 시작 실패한다.
@@ -256,6 +256,13 @@ machines:
 7. 전체 동기화: 머신마다 `ps -a --filter label=gh-ars.unit`(종료된 컨테이너 포함)로 unit 입양, 고아 정리(§8.3).
 8. events 스트림: SSH 머신은 유지되는 SSH 연결 위에, local 머신은 직접 `events`를 연다. 이벤트의 unit/role 식별은 컨테이너 이름 `gh-ars-<unit>-runner|sidecar`로 하고(§4.2), 라벨은 스트림 구독 선택(`--filter label=`)과 `ps --filter`·볼륨·slice 대조에 쓴다. SSH 단절 → unhealthy, 재접속 시 전체 동기화 반복. 재접속은 지수 백오프(1s 시작, 2배, 최대 30s, ±20% jitter, 성공 시 리셋)로 시도하며 SSH 접속 타임아웃은 10s(코드 상수). local은 "연결 단절"이 없고 runtime 데몬 다운(events 스트림 종료 + `info` 실패)을 unhealthy로 보며, events 재시작에 같은 백오프를 쓴다.
 9. 메시지 세션 생성 후 루프 진입. `minRunners`만큼 warm runner는 루프의 desired 계산으로 자연히 배치된다.
+
+**재접속 회차가 다시 도는 범위.** §7.1-8의 백오프 재시작(SSH 단절, 회차 실패)과 local의 events 재시작은 위 시작 시퀀스 전체를 다시 돌지 않는다. 설정 로드·인증(1·2), scale set 확보(5), R24 평가(6)는 시작 시 1회뿐이고, 회차가 다시 도는 것은 아래다.
+
+- **preflight(3)의 도달·runtime·권한 확인**: 접속을 버린 회차만. 접속이 살아 있는 회차(local의 events 재시작)는 건너뛴다.
+- **events 열기 → `info` → 예산 판정 → 전체 동기화(7)**: 모든 회차. events를 먼저 여는 순서는 8이 정한 것이다(반대면 그 사이의 `die`를 놓친다).
+- **예산 판정(R21)**: 회차의 `info`로 매번 재계산한다. 위반의 처리는 "재접속 회차인가"가 아니라 **그 머신을 처음 판정하는가**로 갈린다. 처음이면 3의 분류 그대로다(시작 시 시작 실패, 시작 시 미도달이었다가 재접속 후 드러나면 `Failed`). 이미 한 번 통과했던 머신의 재판정에서 위반이면 **상태를 바꾸지 않고** 그 scale set의 physicalMax를 0으로 반영하고 경고한다. `Failed`는 시작 시 판정하지 못한 정적 모순을 뒤늦게 발견한 경우를 위한 것이고, VM 축소·cgroup 제한 변경처럼 런타임에 예산이 줄어든 것은 환경 변화라 범주가 다르다. physicalMax 0이면 capacity 기여가 이미 0이라 배치는 그것만으로 막히는 반면, `Unhealthy`로 내리면 그 머신의 Dying unit 정리가 보류되고(§8.3) 아직 job을 돌리는 unit의 `die`를 받을 통로까지 끊긴다. R21은 (머신 × scale set) 쌍의 판정이라 머신 전체를 내릴 근거도 되지 못한다. 예산이 회복되면 다음 회차에 자동 복귀한다. 로그는 전이 시점 1회만 오류로 남기고 이후 반복 회차는 디버그로 낮춘다.
+- **pre-pull(4)**: 최초 접속 회차에서만 전체 동기화 앞에 둔다(콜드 머신은 이미지가 실제로 없을 수 있다). 재접속 회차에서는 동기화 뒤로 미룬다 — 재동기화와 `die` 수신이 레지스트리 가용성에 인질로 잡히면 안 된다.
 
 ### 7.2 루프
 1. `GetMessage(maxCapacity = 현재 capacity)`. capacity는 **동적**: unhealthy 머신은 제외되어 다음 폴링부터 유입이 줄어든다.

@@ -27,7 +27,17 @@ type fakeExec struct {
 	stream string
 	// budget 은 명령마다 남아 있던 ctx 여유다(상한이 없으면 항목이 없다). [§8.3 상수 표]
 	budget map[string]time.Duration
+	// holdAfter 는 이 번째 이후의 Stream 이 ctx 취소까지 열린 채로 있게 한다(0 이면 전부 즉시 EOF).
+	// 회차 하나가 Resynced 까지 가는 것을 재현하는 데 쓴다.
+	holdAfter int
+	streamN   int
 }
+
+// holdReader 는 ctx 가 끝날 때까지 열려 있는 스트림이다(실제 executor 의 Stream 과 같은 계약).
+type holdReader struct{ done <-chan struct{} }
+
+func (h holdReader) Read([]byte) (int, error) { <-h.done; return 0, io.EOF }
+func (h holdReader) Close() error             { return nil }
 
 func (f *fakeExec) note(key string, ctx context.Context) {
 	dl, ok := ctx.Deadline()
@@ -75,10 +85,15 @@ func (f *fakeExec) Run(ctx context.Context, c executor.Cmd) (executor.Result, er
 	return f.h(c.Sudo, c.Argv)
 }
 
-func (f *fakeExec) Stream(_ context.Context, c executor.Cmd) (io.ReadCloser, error) {
+func (f *fakeExec) Stream(ctx context.Context, c executor.Cmd) (io.ReadCloser, error) {
 	f.mu.Lock()
 	f.log = append(f.log, cmdKey(c))
+	f.streamN++
+	hold := f.holdAfter > 0 && f.streamN > f.holdAfter
 	f.mu.Unlock()
+	if hold {
+		return holdReader{ctx.Done()}, nil
+	}
 	return io.NopCloser(strings.NewReader(f.stream)), nil
 }
 
@@ -595,5 +610,65 @@ func TestPreflight_S8_3_CommandTimeouts(t *testing.T) {
 		if got > tc.want || got < tc.want-5*time.Second {
 			t.Fatalf("%q 상한 %v, want ≈%v", tc.prefix, got, tc.want)
 		}
+	}
+}
+
+// TestRun_S7_1_4_PrePullOrderByRound: pre-pull 의 자리는 "최초 접속인가"로 갈린다. 최초 접속 회차는
+// 동기화 앞에서 pull 하고(콜드 머신은 이미지가 실제로 없다), 이미 한 번 성공했던 머신의 재접속
+// 회차는 events·info·관측·Resynced 뒤로 미룬다 — 레지스트리 장애가 재동기화와 die 수신까지 막으면
+// 안 된다. 명령 로그의 순서가 그 계약이다. [§7.1 재접속 회차, §7.1-4]
+func TestRun_S7_1_4_PrePullOrderByRound(t *testing.T) {
+	// 1회차 스트림은 즉시 EOF(회차 실패 → 재접속), 2회차부터는 열린 채로 둔다.
+	ex := &fakeExec{holdAfter: 1, h: uid("0", func(_ bool, argv []string) (executor.Result, error) {
+		if isCmd(argv, "docker", "info") {
+			return ok(dockerInfoJSON("systemd", "2"))
+		}
+		return executor.Result{}, nil
+	})}
+	// SSH 머신이라 회차마다 접속을 버리고 preflight 부터 다시 돈다(§10.1) — 회차 경계가 `id -u` 다.
+	a, err := New(Spec{Name: "m1", Runtime: domain.RuntimeDocker, Mode: domain.ModeNone,
+		Images:      []string{"img:1"},
+		NewExecutor: func() (executor.Executor, error) { return ex, nil }}, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sink := &recSink{}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	a.Run(ctx, sink)
+
+	// 회차 경계는 `id -u`(preflight 시작)다.
+	var rounds [][]string
+	for _, c := range ex.calls() {
+		if strings.HasPrefix(c, "id -u") {
+			rounds = append(rounds, nil)
+		}
+		if len(rounds) > 0 {
+			rounds[len(rounds)-1] = append(rounds[len(rounds)-1], c)
+		}
+	}
+	if len(rounds) < 2 {
+		t.Fatalf("회차 %d개, want ≥2: %v", len(rounds), ex.calls())
+	}
+	idx := func(round []string, prefix string) int {
+		for i, c := range round {
+			if strings.HasPrefix(c, prefix) {
+				return i
+			}
+		}
+		return -1
+	}
+	if p, e := idx(rounds[0], "docker pull"), idx(rounds[0], "docker events"); p < 0 || e < 0 || p > e {
+		t.Fatalf("최초 접속 회차: pull=%d events=%d, want pull 이 앞: %v", p, e, rounds[0])
+	}
+	r := rounds[1]
+	p, v := idx(r, "docker pull"), idx(r, "docker volume ls")
+	if p < 0 || v < 0 || p < v {
+		t.Fatalf("재접속 회차: pull=%d volumeLs=%d, want pull 이 동기화 뒤: %v", p, v, r)
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if sink.resynced == 0 {
+		t.Fatal("재접속 회차가 Resynced 까지 가지 못했다")
 	}
 }

@@ -126,9 +126,9 @@ GetRunner(RunnerName) → (found) RemoveRunner → runner 컨테이너 rm → si
 
 ### 3.3 Machine health  [§7.1-3, §7.1-8, §10.1]
 
-- `Healthy` → `Unhealthy`: SSH 단절(keepalive 연속 실패 포함, §10.1), events 스트림 종료, pre-pull 실패, `info` 실패. capacity에서 제외. **명령 하나의 실패·타임아웃은 트리거가 아니다** — 그것은 그 unit의 정리·기동 재시도(§8.3)로 처리한다.
+- `Healthy` → `Unhealthy`: SSH 단절(keepalive 연속 실패 포함, §10.1), events 스트림 종료, pre-pull 실패, `info` 실패, 전체 동기화 관측(`ps`, `volume ls`) 실패. capacity에서 제외. **명령 하나의 실패·타임아웃은 트리거가 아니다** — 그것은 그 unit의 정리·기동 재시도(§8.3)로 처리한다.
 - `Unhealthy` → `Healthy`: 백오프 재접속 성공 + 전체 동기화 완료.
-- `Failed`: preflight의 설정·환경 모순(R16, R21). 시작 시 발견되면 프로세스 시작 실패. 재접속 후 preflight에서 발견되면 그 머신만 `Failed`로 두고 오류 로그. `Failed`는 capacity와 배치에서 제외되고 **재접속 대상에서도 제외**된다(에이전트 goroutine 종료). [§7.1-3, R21]
+- `Failed`: 설정·환경 모순(R16, R21) — **그 머신의 최초 판정에서 드러난 것만이다**. 시작 시 발견되면 프로세스 시작 실패. 시작 시 미도달이었다가 재접속 후 발견되면 그 머신만 `Failed`로 두고 오류 로그. 이미 한 번 통과했던 머신의 R21 재판정 위반은 `Failed`가 아니라 physicalMax 0 + 경고다(SPEC §7.1 "재접속 회차가 다시 도는 범위"). `Failed`는 capacity와 배치에서 제외되고 **재접속 대상에서도 제외**된다(에이전트 goroutine 종료). [§7.1-3, R21]
 
 ### 3.4 resource (Phase 1)  [§6.0, §8.1, §9.3, R25]
 
@@ -252,6 +252,7 @@ type Runtime interface {
     Kind() domain.RuntimeKind
     Info(ctx) (Info, error)
     Pull(ctx, image string) error
+    ImageExists(ctx, image string) (bool, error)                  // image inspect 종료 코드. pull 실패를 레지스트리 장애와 이미지 부재로 가른다 [§7.1-4]
     List(ctx, labelFilter string) ([]Container, error)           // 항상 ps -a
     Create(ctx, spec CreateSpec) error
     CopyIn(ctx, container string, tar io.Reader, destDir string) error   // docker cp - <ctr>:<destDir>
@@ -267,7 +268,7 @@ func NewDocker(ex executor.Executor, sudo bool, log *slog.Logger) Runtime   // s
 func NewPodman(ex executor.Executor, sudo bool, log *slog.Logger) Runtime
 ```
 
-docker/podman 구현은 argv 조립과 출력 파싱만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`. `info`는 두 runtime 모두 `--format '{{json .}}'`를 파싱한다. `events`는 docker만 `--format '{{json .}}'`를 쓰고, podman은 `--format json`(SPEC §5 명시)이다 — 둘 다 결과는 JSON Lines 한 줄씩이지만 podman의 이벤트 스키마 자체가 docker와 다르다(`flavor.eventsFormat()`으로 분기). podman의 시각 필드는 버전에 따라 유닉스 정수(`time`, `timeNano`)로도 RFC3339 문자열(`Time`)로도 오므로 양쪽을 모두 받는다 — 정수를 `time.Time`으로 받으려다 unmarshal이 실패하면 그 줄이 통째로 버려지고, 그러면 **모든** 이벤트가 사라져 `die`가 영영 오지 않는다(실측 podman 6.1.1, 2026-09-09). 같은 이유로 `flavor.parseEvent`는 "관심 없는 줄"과 "읽지 못한 줄"을 구분한다. 구독 argv에 `--filter type=container`가 있으므로 다른 type이나 이름 없는 줄이 오는 것도 스키마 어긋남으로 센다. **첫 읽지 못한 줄은 즉시 `Warn`으로 남기고 스트림은 유지한다**(이후는 종료 오류에 싣는 집계로 갈음): 스키마가 통째로 어긋나면 스트림은 정상적으로 열린 채 며칠씩 유지되고 모든 줄이 조용히 버려지는데, 종료 오류만으로는 그 신호가 영영 나오지 않는다(§7.1-8의 재시작 트리거가 오지 않는다). 중간 통지를 `errCh`로 보내지는 않는다 — machine 층이 그것을 회차 종료로 읽는다. 그래서 `NewDocker`/`NewPodman`은 로거를 받는다(nil이면 `slog.Default()`). `ps`는 `{{json .}}`를 쓰지 않는다: 그 출력의 `Labels`는 "k=v,k=v"를 이스케이프 없이 이어붙인 문자열이라 이미지가 물려준 라벨 값에 `,gh-ars.mode=none` 같은 조각이 있으면 실제 라벨을 덮어쓸 수 있다. 대신 `{{.Names}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label "gh-ars.unit"}}…` 처럼 §4.2의 gh-ars.* 키 5개를 하나씩 뽑는 탭 구분 템플릿을 쓰고, `Container.Labels`에는 그 키만 담는다(입양 복원에 그것만 필요하다). 비0 종료는 `*ExitError{Argv, ExitCode, Stderr}`로 올리고, `Remove`/`VolumeRemove`는 "이미 없음" 응답을 성공으로 흡수한다(§8.3 멱등).
+docker/podman 구현은 argv 조립과 출력 파싱만 다르다. 공통 골격은 `cli.go`, 차이는 `docker.go` / `podman.go`. `info`는 두 runtime 모두 `--format '{{json .}}'`를 파싱한다. `events`는 docker만 `--format '{{json .}}'`를 쓰고, podman은 `--format json`(SPEC §5 명시)이다 — 둘 다 결과는 JSON Lines 한 줄씩이지만 podman의 이벤트 스키마 자체가 docker와 다르다(`flavor.eventsFormat()`으로 분기). podman의 시각 필드는 버전에 따라 유닉스 정수(`time`, `timeNano`)로도 RFC3339 문자열(`Time`)로도 오므로 양쪽을 모두 받는다 — 정수를 `time.Time`으로 받으려다 unmarshal이 실패하면 그 줄이 통째로 버려지고, 그러면 **모든** 이벤트가 사라져 `die`가 영영 오지 않는다(실측 podman 6.1.1, 2026-09-09). 같은 이유로 `flavor.parseEvent`는 "관심 없는 줄"과 "읽지 못한 줄"을 구분한다. 구독 argv에 `--filter type=container`가 있으므로 다른 type이나 이름 없는 줄이 오는 것도 스키마 어긋남으로 센다. **첫 읽지 못한 줄은 즉시 `Warn`으로 남기고 스트림은 유지한다**(이후는 종료 오류에 싣는 집계로 갈음): 스키마가 통째로 어긋나면 스트림은 정상적으로 열린 채 며칠씩 유지되고 모든 줄이 조용히 버려지는데, 종료 오류만으로는 그 신호가 영영 나오지 않는다(§7.1-8의 재시작 트리거가 오지 않는다). 중간 통지를 `errCh`로 보내지는 않는다 — machine 층이 그것을 회차 종료로 읽는다. 그래서 `NewDocker`/`NewPodman`은 로거를 받는다(nil이면 `slog.Default()`). `ps`는 `{{json .}}`를 쓰지 않는다: 그 출력의 `Labels`는 "k=v,k=v"를 이스케이프 없이 이어붙인 문자열이라 이미지가 물려준 라벨 값에 `,gh-ars.mode=none` 같은 조각이 있으면 실제 라벨을 덮어쓸 수 있다. 대신 `{{.Names}}\t{{.State}}\t{{.CreatedAt}}\t{{.Label "gh-ars.unit"}}…` 처럼 §4.2의 gh-ars.* 키 5개를 하나씩 뽑는 탭 구분 템플릿을 쓰고, `Container.Labels`에는 그 키만 담는다(입양 복원에 그것만 필요하다). 비0 종료는 `*ExitError{Argv, ExitCode, Stderr}`로 올리고, `Remove`/`VolumeRemove`는 "이미 없음" 응답을 성공으로 흡수한다(§8.3 멱등). `ImageExists`는 `image inspect <image>`의 종료 코드만 본다: 0이면 있음, "이미 없음" 응답(`Remove`와 같은 판정)이면 없음, 그 밖의 실패는 오류다 — 오류를 "없음"으로 접으면 §7.1-4의 완화가 레지스트리 장애 때 통째로 무력해진다.
 
 **sidecar 컨테이너 CreateSpec 값** [§9.1]:
 
@@ -455,7 +456,7 @@ Controller가 머신에 요구하는 것은 `MachineAgent` 인터페이스(`Name
 | `msgEvent` (`die`, role=runner) | unit(Creating/Starting/Running/Draining 모두)을 `markDying`으로 `Dying`으로 → goroutine `cleanupUnit`. `markDying`은 Dying 전이의 유일한 경로이며 `Busy && !Completed`면 RunnerName을 `pendingCompletion`에 넣는다(등록 시각·머신·RunnerID 기록) — tick 미등록 판정 등 다른 경로로 죽어도 같은 보정을 받는다. 그 뒤 `minRunners` 미달분만 보충하고 **assigned 기반 신규 생성은 하지 않는다**(§7.2-3 식의 귀결). 이미 `Dying`/정리된 unit의 die는 무시. [§7.2-3, §7.2-5] |
 | `msgEvent` (`die`, role=sidecar) | runner가 살아 있으면 로그만(runner die 시 함께 정리). |
 | `msgHealth` | 머신 health 갱신 → capacity 재계산 → `SetMaxRunners`. unhealthy 머신의 Dying unit은 정리를 보류한다. `Failed`(재접속 preflight의 R16/R21 위반)는 되돌리지 않는다: 이후의 health·재동기화 메시지로도 healthy로 복귀하지 않는다(§3.3). |
-| `msgResynced` | **부품은 스냅샷이 권위다.** `plan.Reconcile` 실행 **전에** 이 머신 소속 known unit의 `Parts`를 `Obs`가 보여준 부품 집합으로 덮어쓴다(정리 실패나 외부 rm으로 캐시가 어긋나면 §8.3의 slot 점유 계산이 틀어진다). `State`는 유지한다 — 상태 판정에는 GitHub 등록 대조가 필요해 `Reconcile`이 판정하지 않는다(§5 책임 경계). `Busy`도 유지한다 — 출처가 머신 이벤트가 아니라 메시지 세션(`msgJobStarted`)이라 SSH 단절로 낡지 않고, 되채우는 경로가 없어 리셋하면 남은 생애 동안 `false`로 고정된다. 그 다음 `Reconcile` 결과의 Adopt/RemoveUnit/RemoveOrphan을 적용한다(보류된 Dying 포함). RemoveOrphan은 unit id별로 모아 **runner 이름 없는 Dying unit**으로 등록한다(`Mode=sidecar`, `Foreign`, 관측된 Parts): `cleanupUnit`의 GitHub 단계만 건너뛰고 sidecar → 볼륨 → slice 순서, tick 재시도, slot 점유를 그대로 탄다(고아 등록은 GitHub이 자동 제거, §3.2). 관측 시각(`At`) 이후 `Starting`이 된 unit은 Creating 예외(§5). 부품 집합만 판정하고 GitHub은 조회하지 않는다. 이 머신 소속 `pendingCompletion` 항목을 비운다(§7.2-3 안전장치). 머신 healthy 복귀. |
+| `msgResynced` | **부품은 스냅샷이 권위다.** `plan.Reconcile` 실행 **전에** 이 머신 소속 known unit의 `Parts`를 `Obs`가 보여준 부품 집합으로 덮어쓴다(정리 실패나 외부 rm으로 캐시가 어긋나면 §8.3의 slot 점유 계산이 틀어진다). `State`는 유지한다 — 상태 판정에는 GitHub 등록 대조가 필요해 `Reconcile`이 판정하지 않는다(§5 책임 경계). `Busy`도 유지한다 — 출처가 머신 이벤트가 아니라 메시지 세션(`msgJobStarted`)이라 SSH 단절로 낡지 않고, 되채우는 경로가 없어 리셋하면 남은 생애 동안 `false`로 고정된다. 그 다음 `Reconcile` 결과의 Adopt/RemoveUnit/RemoveOrphan을 적용한다(보류된 Dying 포함). RemoveOrphan은 unit id별로 모아 **runner 이름 없는 Dying unit**으로 등록한다(`Mode=sidecar`, `Foreign`, 관측된 Parts): `cleanupUnit`의 GitHub 단계만 건너뛰고 sidecar → 볼륨 → slice 순서, tick 재시도, slot 점유를 그대로 탄다(고아 등록은 GitHub이 자동 제거, §3.2). 관측 시각(`At`) 이후 `Starting`이 된 unit은 Creating 예외(§5). 부품 집합만 판정하고 GitHub은 조회하지 않는다. 이 머신 소속 `pendingCompletion` 항목을 비운다(§7.2-3 안전장치). `Reconcile` 전에 스냅샷의 `Info`로 `applyInfo`를 다시 돌려 예산·physicalMax·effectiveMax를 갱신한다(시작 시 미도달이었던 머신은 그때까지 0이라 복귀시키기만 해서는 capacity에 한 칸도 보태지 못한다). 이 경로의 R21 위반은 재판정이므로 `Failed`가 아니라 physicalMax 0 + 경고다(§7.1). 머신 healthy 복귀. |
 | `msgTick` | **GitHub 등록 대조의 유일한 구현 주체.** Starting/Running unit(**Draining 제외**, 대조가 진행 중이 아닌 것)을 모아 goroutine이 `GetRunner`를 부르고 결과를 `msgRegistration`으로 돌려보낸다(루프 안에서 GitHub을 부르지 않는다). `Creating`의 기동 타임아웃 판정. healthy 머신의 `Dying` unit 중 정리가 진행 중이 아닌 것은 `cleanupUnit` 재시도. `pendingCompletion`·`completedIDs`에서 5분 지난 항목 제거(§7.2-3 안전장치, §8.3 상수 표). [§8.3] |
 | `msgRegistration` | `Found`면 `learnRunnerID`(§4.5). Starting: 등록되면 `Running`, 미등록이고 grace 초과면 `Dying`, 이내면 대기. Running: 미등록이면 grace 없이 `Dying`. 오류는 로그만(다음 tick 재시도). unit이 그 사이 다른 상태가 됐으면 무시. [§8.3] |
 | `msgUnitStarted` | 먼저 `learnRunnerID`(unit이 이미 죽었거나 정리됐어도 id는 `pendingCompletion`·`completedIDs` 대조에 쓴다). 성공: `Creating → Starting`(전이 시각 기록 — §5 Creating 예외 판정용). 실패: `Dying`으로 두고 `cleanupUnit`(역순 정리, RemoveRunner 포함). 다음 `msgDesired`에서 재배치. unit이 이미 `Dying`이면 상태는 바꾸지 않는다. |
@@ -474,7 +475,7 @@ JIT 생성(GitHub) → [sidecar: slice Create, 볼륨 3개 Create, sidecar 컨�
 
 머신마다 goroutine 하나. 책임: 접속 유지, preflight, pre-pull, `Events` 스트림 수신 → `msgEvent`, 단절 시 백오프 재접속 → 재접속 후 `Observe()`(ps -a, 볼륨, slice) → `msgResynced`. Controller는 `Agent.Runtime()`, `Agent.Slices()`로 명령을 보낸다.
 
-`Run(ctx, sink)`의 회차: `Events` 열기 → `info`(데몬 생존) → `Observe`(관측 시각 기록) → `Resynced` → 스트림 소비. **events를 먼저 열고 관측한다**(반대면 그 사이의 die를 놓친다). 열기 직후 스트림이 이미 끝나 있으면 `Resynced`를 보내지 않고 실패로 본다. `Resynced`를 보낸 회차라도 백오프 리셋은 스트림이 백오프 최대값(30s) 이상 유지된 경우에만 한다(§6 listener 세션과 동일 기준). 유지 시간은 회차 전체가 아니라 events 스트림이 열려 있던 시간으로 잰다(pre-pull이 오래 걸린 회차가 스트림 즉사에도 리셋 자격을 얻으면 안 된다). 스트림이 끝나면 `Unhealthy` → 백오프 → 다음 회차. 첫 회차는 `Resynced`·`Unhealthy`·`Failed`(설정·환경 모순이 드러난 경우, §3.3) 중 하나를 반드시 보내며, Controller는 시작 시 머신마다 그 첫 통지를 기다린 뒤 메시지 세션을 연다(§7.1-7·8 → §7.1-9 순서. 첫 desired로 만든 unit의 die를 events가 받아야 한다). 시작 시 §7.1-7 동기화도 이 첫 회차의 `Resynced`다.
+`Run(ctx, sink)`의 회차: (필요하면 재접속 preflight →) `Events` 열기 → `info`(데몬 생존) → 예산 재판정 → `Observe`(관측 시각 기록) → `Resynced` → (재접속 회차면 여기서 pre-pull) → 스트림 소비. **events를 먼저 열고 관측한다**(반대면 그 사이의 die를 놓친다). 열기 직후 스트림이 이미 끝나 있으면 `Resynced`를 보내지 않고 실패로 본다. `Resynced`를 보낸 회차라도 백오프 리셋은 스트림이 백오프 최대값(30s) 이상 유지된 경우에만 한다(§6 listener 세션과 동일 기준). 유지 시간은 회차 전체가 아니라 events 스트림이 열려 있던 시간으로 잰다(pre-pull이 오래 걸린 회차가 스트림 즉사에도 리셋 자격을 얻으면 안 된다). **pre-pull의 자리는 최초 접속인지로 갈린다**(SPEC §7.1 "재접속 회차가 다시 도는 범위"): 최초 접속 회차는 `Preflight`가 동기화 전에 pull하고(콜드 머신은 이미지가 실제로 없다), 이미 한 번 pull에 성공했던 머신의 재접속 회차는 `Resynced` 뒤로 미룬다 — 재동기화와 `die` 수신이 레지스트리 가용성에 인질로 잡히면 안 된다. 미룬 pull은 **이벤트 소비와 나란히** 돈다(`evCh`는 무버퍼라 순서만 미루고 동기로 돌리면 `Events` goroutine이 첫 이벤트에서 막혀 `die` 수신이 그대로 레지스트리에 묶인다). 실패하면 그 회차는 `Resynced`를 보낸 뒤 실패한 것이므로 `Unhealthy`로 이어진다. 스트림이 끝나면 `Unhealthy` → 백오프 → 다음 회차. 첫 회차는 `Resynced`·`Unhealthy`·`Failed`(설정·환경 모순이 드러난 경우, §3.3) 중 하나를 반드시 보내며, Controller는 시작 시 머신마다 그 첫 통지를 기다린 뒤 메시지 세션을 연다(§7.1-7·8 → §7.1-9 순서. 첫 desired로 만든 unit의 die를 events가 받아야 한다). 시작 시 §7.1-7 동기화도 이 첫 회차의 `Resynced`다.
 
 preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 1. SSH 머신: host key 검증 후 접속(타임아웃 10s). local: 생략.
@@ -483,8 +484,8 @@ preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
    - docker: `docker info`(sudo 없음). 실패는 모드와 무관하게 unhealthy(R16은 환경 모순 전용, SPEC §9.2 머리말).
    - podman: `podman info` → 실패면 `sudo -n podman info`(모드 무관). 성공한 경로를 `Machine.Sudo`로 고정. 둘 다 실패 → 모드와 무관하게 unhealthy. sidecar이고 고정 경로의 `Rootless=true`면 아직 시도하지 않은 `sudo -n podman info`를 시도해 rootful이면 `Sudo=true`로 바꾸고, 그래도 rootless면 R16 오류. [§10.2 규칙 3]
 4. sidecar scale set이면: rootful 확인(`Info.Rootless == false` — podman은 3단계에서 이미 걸리고 docker는 여기가 유일한 판정 지점이다), `CgroupDriver == systemd && CgroupVersion == 2` 확인, `Slices.Check()`(root 아니면 sudo -n) → 실패 시 R16 오류.
-5. resources: 생략 시 `info`의 CPUs/MemoryBytes, 명시 시 탐지값으로 cap(R21 경고). physicalMax·effectiveMax 계산(R21 오류, R22 경고).
-6. pre-pull: runner 이미지, sidecar면 sidecar 이미지. 실패 → unhealthy.
+5. resources 판정(R21): 생략 시 `info`의 CPUs/MemoryBytes, 명시 시 탐지값으로 cap(R21 경고). 에이전트는 `Spec.Verify(info)`로 위반 여부만 받는다 — **physicalMax·effectiveMax를 실제로 계산해 `domain.Machine`에 반영하는 것은 Controller의 `applyInfo`다**(설정 값과 unit 예산을 아는 쪽이 Controller다, §2). `applyInfo`는 시작 시 preflight 결과로 한 번, 그 뒤로는 `msgResynced`가 싣고 온 그 회차의 `info`로 매번 다시 돈다. 즉 **R21은 회차마다 재판정된다**(R21 오류, R22 경고).
+6. pre-pull: runner 이미지, sidecar면 sidecar 이미지. 실패 → unhealthy. 단 `ImageExists`가 참이면 경고로 낮추고 성공(§7.1-4).
 
 2~5단계의 확인 명령과 관측(`ps`, `volume ls`), events 스트림 **열기**에는 probe 상한(§8.3 상수 표)을 건다. 열기에만 거는 이유는 스트림 자체가 장기 실행이기 때문이고, 상한은 열기 구간에만 타이머로 스트림 ctx를 취소해 건다. 그 ctx는 같은 회차의 `info`·관측·스트림 소비까지 덮으므로 §1-5의 취소 사유 규약을 쓴다(`watchdog`이 사유를 남기고 `reported`가 치환한다). 6단계 pull은 이미지 크기에 비례하므로 별도의 pre-pull 상한(§8.3)을 쓴다.
 
@@ -492,7 +493,12 @@ preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 
 `NewDocker/NewPodman(ex, sudo, log)`와 `systemd.New(ex, sudo)`의 `sudo`는 위 2·3·4단계 결과에서 나온다(docker: 항상 false, podman: 3단계 결과, systemd: `!root`).
 
-5단계의 예산 판정(R21)만은 설정 값을 아는 Controller가 `Spec.Verify(info) error`로 넘긴다(machine은 config에 의존하지 않는다, §2). 에이전트는 이 오류를 R16과 같은 등급(`ErrFatal`)으로 다뤄 시작 시에는 그대로 올리고 재접속 후에는 `Failed`로 만든다. 접속 재료도 같은 이유로 `machine.SSH`(config.SSH의 값 복사)로 받는다.
+5단계의 예산 판정(R21)만은 설정 값을 아는 Controller가 `Spec.Verify(info) error`로 넘긴다(machine은 config에 의존하지 않는다, §2). 에이전트는 preflight뿐 아니라 **회차마다** `info` 직후에 이것을 부르고, 위반의 등급은 **그 머신을 처음 판정하는가**로 갈린다(SPEC §7.1 "재접속 회차가 다시 도는 범위"):
+
+- 최초 판정에서 위반 → R16과 같은 등급(`ErrFatal`). 시작 시에는 그대로 올려 시작 실패, 시작 시 미도달이었다가 뒤늦게 드러나면 `Failed`(재접속 없음).
+- 이미 한 번 통과했던 머신의 재판정에서 위반 → **오류가 아니다.** 회차는 그대로 진행하고 `Resynced`에 그 `info`를 실어 보낸다. Controller의 `applyInfo`가 그것으로 physicalMax 0을 계산해 반영하므로 배치는 그것만으로 막히고, `Health`는 건드리지 않는다. 예산이 회복되면 다음 회차의 `applyInfo`가 자동으로 되돌린다. 로그는 위반으로 넘어간 회차에만 `Error`, 이어지는 회차는 `Debug`(30s마다 같은 오류를 찍지 않는다). 판정 주체가 둘(에이전트의 `Verify`, Controller의 `applyInfo`)이므로 "처음인가"의 기록도 둘 다 가진다: 에이전트는 `Verify` 성공 이력, Controller는 `applyInfo`를 시작 경로로 부르는지 재동기화 경로로 부르는지.
+
+접속 재료도 같은 이유로 `machine.SSH`(config.SSH의 값 복사)로 받는다.
 
 백오프: 1s 시작, ×2, 최대 30s, ±20% jitter, 성공 시 리셋(성공의 기준은 위 회차 문단). local 머신은 events 재시작에만 적용. [§7.1-8]
 

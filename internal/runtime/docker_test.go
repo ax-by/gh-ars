@@ -560,3 +560,32 @@ func TestDocker_S9_2_RootlessDetection(t *testing.T) {
 		t.Fatalf("rootful 인데 Rootless=%v (err=%v)", got.Rootless, err)
 	}
 }
+
+// [§7.1-4, DESIGN §4.2] ImageExists 는 `image inspect` 종료 코드만 본다: "이미 없음"만 false 로 접고
+// 그 밖의 실패는 오류다 — 오류를 false 로 접으면 pull 실패 완화가 레지스트리 장애 때 무력해진다.
+func TestDocker_S7_1_4_ImageExists(t *testing.T) {
+	f, rt := newDockerFake(t)
+	ctx := context.Background()
+	img := "ghcr.io/actions/actions-runner:2.337.0"
+
+	f.results = []executor.Result{{Stdout: []byte("[{}]\n")}}
+	ok, err := rt.ImageExists(ctx, img)
+	if err != nil || !ok {
+		t.Fatalf("ImageExists = %v, %v, want true, nil", ok, err)
+	}
+	want := []string{"docker", "image", "inspect", img}
+	if c := f.last(); !reflect.DeepEqual(c.Argv, want) {
+		t.Fatalf("argv = %v, want %v", c.Argv, want)
+	}
+
+	f.results = []executor.Result{{ExitCode: 1, Stderr: []byte("Error response from daemon: No such image: " + img + "\n")}}
+	ok, err = rt.ImageExists(ctx, img)
+	if err != nil || ok {
+		t.Fatalf("없는 이미지: ImageExists = %v, %v, want false, nil", ok, err)
+	}
+
+	f.results = []executor.Result{{ExitCode: 1, Stderr: []byte("Cannot connect to the Docker daemon at unix:///var/run/docker.sock\n")}}
+	if ok, err := rt.ImageExists(ctx, img); err == nil || ok {
+		t.Fatalf("데몬 접속 실패가 '없음'으로 접혔다: %v, %v", ok, err)
+	}
+}

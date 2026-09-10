@@ -106,7 +106,8 @@ func TestDesired_S7_2_1_CapacityFollowsHealth(t *testing.T) {
 
 // TestResynced_S7_1_3_ReconnectAppliesBudget: 시작 시 미도달이라 예산이 0 이던 머신은 재접속만으로는
 // 배치되지 못한다. 그 회차의 info 로 physicalMax·effectiveMax 를 다시 계산해야 capacity 에 든다.
-// 재계산에서 R21 위반이 드러나면 그 머신만 Failed 다(재접속 대상 제외). [§7.1-3, §8.1, R21, R22]
+// 재계산에서 R21 위반이 드러나면(= 재판정) 상태는 그대로 두고 physicalMax 만 0 으로 반영한다 —
+// Failed 는 최초 판정 전용이다(TestStart_R21_FirstJudgmentFails). [§7.1 재접속 회차, §8.1, R21, R22]
 func TestResynced_S7_1_3_ReconnectAppliesBudget(t *testing.T) {
 	h := newHarness(t, 0)
 	m := h.c.machineByName(testMachine)
@@ -132,17 +133,36 @@ func TestResynced_S7_1_3_ReconnectAppliesBudget(t *testing.T) {
 	}
 	h.pumpUntil(isUnitStarted)
 
-	// 재접속 후 예산이 unit 예산보다 작으면 R21 위반 → Failed. 이후 재동기화로도 복귀하지 않는다.
+	// 한 번 통과했던 머신의 재판정에서 예산이 unit 예산 아래로 떨어지면(VM 축소 등) R21 위반이지만
+	// Failed 도 Unhealthy 도 아니다: 상태를 유지한 채 physicalMax 0 으로만 반영한다. 배치는 그것만으로
+	// 막히고, 상태를 내리면 그 머신의 Dying 정리와 die 수신까지 끊긴다. [§7.1 재접속 회차, R21]
 	resync(runtime.Info{CPUs: 0.5, MemoryBytes: 512 << 20})
-	if m.Health != domain.Failed {
-		t.Fatalf("health %s, want Failed", m.Health)
+	if m.Health != domain.Healthy {
+		t.Fatalf("health %s, want Healthy (재판정 위반은 상태를 바꾸지 않는다)", m.Health)
+	}
+	if m.PhysicalMax != 0 || m.EffectiveMax != 0 {
+		t.Fatalf("physicalMax=%d effectiveMax=%d, want 0/0", m.PhysicalMax, m.EffectiveMax)
 	}
 	if got := h.max.last(); got != 0 {
-		t.Fatalf("SetMaxRunners %d, want 0 (Failed 는 capacity 에서 빠진다)", got)
+		t.Fatalf("SetMaxRunners %d, want 0 (physicalMax 0 은 capacity 에서 빠진다)", got)
 	}
+	// 예산이 회복되면 다음 회차에 자동 복귀한다.
 	resync(runtime.Info{CPUs: 4, MemoryBytes: 4 << 30})
-	if m.Health != domain.Failed {
-		t.Fatalf("Failed 가 되돌려졌다: %s", m.Health)
+	if m.Health != domain.Healthy || m.PhysicalMax != 4 {
+		t.Fatalf("machine %+v, want Healthy 4 (예산 회복 시 자동 복귀)", *m)
+	}
+	if got := h.max.last(); got != 4 {
+		t.Fatalf("SetMaxRunners %d, want 4", got)
+	}
+}
+
+// TestStart_R21_FirstJudgmentFails: 그 머신의 **최초** 판정에서 R21 위반이면 시작 실패다.
+// 재판정의 완화(physicalMax 0 + 경고)가 최초 판정까지 무르게 만들지 않는다. [§7.1-3, §7.1 재접속 회차, R21]
+func TestStart_R21_FirstJudgmentFails(t *testing.T) {
+	h := newHarness(t, 0)
+	m := h.c.machineByName(testMachine)
+	if err := h.c.applyInfoAtStart(m, runtime.Info{CPUs: 0.5, MemoryBytes: 512 << 20}); err == nil {
+		t.Fatal("최초 판정의 R21 위반이 오류가 아니다")
 	}
 }
 

@@ -125,6 +125,9 @@ type Controller struct {
 	checking  map[domain.UnitID]bool      // tick 의 GetRunner 대조 진행 중
 	startedAt map[domain.UnitID]time.Time // Creating → Starting 전이 시각. 그 전에 찍힌 스냅샷의 판정에서 제외 [§8.3 Creating 예외]
 	reached   map[string]bool             // 시작 시 preflight 도달 여부. R24 판정 [§6.2]
+	// r21Violated 는 재판정에서 예산이 unit 예산 아래로 떨어진 머신이다. 전이 시점 1회만
+	// Error 로 남기기 위한 기록이다(30s 마다 같은 오류를 찍지 않는다). [§7.1 재접속 회차, R21]
+	r21Violated map[string]bool
 	// syncing 은 시작 시 전체 동기화(§7.1-7)가 아직 끝나지 않았다는 뜻이다. 그동안은 unit 을 만들지 않는다.
 	syncing bool
 }
@@ -136,22 +139,23 @@ func New(cfg *config.Config, gh github.Client, log *slog.Logger, opts Options) *
 	}
 	opts.defaults()
 	c := &Controller{
-		cfg:       cfg,
-		gh:        gh,
-		log:       log,
-		opts:      opts,
-		ctx:       context.Background(),
-		inbox:     make(chan any, 64),
-		done:      make(chan struct{}),
-		scaleSets: map[string]*scaleSetState{},
-		budgets:   map[string]resource.Budget{},
-		agents:    map[string]MachineAgent{},
-		units:     map[domain.UnitID]*domain.Unit{},
-		runnerIDs: map[domain.UnitID]int64{},
-		cleaning:  map[domain.UnitID]bool{},
-		checking:  map[domain.UnitID]bool{},
-		startedAt: map[domain.UnitID]time.Time{},
-		reached:   map[string]bool{},
+		cfg:         cfg,
+		gh:          gh,
+		log:         log,
+		opts:        opts,
+		ctx:         context.Background(),
+		inbox:       make(chan any, 64),
+		done:        make(chan struct{}),
+		scaleSets:   map[string]*scaleSetState{},
+		budgets:     map[string]resource.Budget{},
+		agents:      map[string]MachineAgent{},
+		units:       map[domain.UnitID]*domain.Unit{},
+		runnerIDs:   map[domain.UnitID]int64{},
+		cleaning:    map[domain.UnitID]bool{},
+		checking:    map[domain.UnitID]bool{},
+		startedAt:   map[domain.UnitID]time.Time{},
+		reached:     map[string]bool{},
+		r21Violated: map[string]bool{},
 	}
 	for _, s := range cfg.ScaleSets {
 		c.scaleSets[s.Name] = &scaleSetState{
@@ -206,7 +210,7 @@ func (c *Controller) Run(ctx context.Context) error {
 			c.log.Warn("machine unhealthy at start", "machine", m.Name, "err", err)
 			continue
 		}
-		if err := c.applyInfo(m, info); err != nil {
+		if err := c.applyInfoAtStart(m, info); err != nil {
 			return err
 		}
 		c.reached[m.Name] = true
@@ -354,11 +358,19 @@ func (c *Controller) agentSpec(m domain.Machine, ss *scaleSetState) machine.Spec
 	return spec
 }
 
-// applyInfo 는 `info` 결과로 머신 예산과 physicalMax·effectiveMax 를 정한다. [§7.1-3, §8.1, R21, R22]
+// applyInfo 는 `info` 결과로 머신 예산과 physicalMax·effectiveMax 를 정한다. 시작 시 preflight
+// 결과로 한 번, 그 뒤로는 재동기화가 실어 온 그 회차의 info 로 매번 다시 돈다(= R21 은 회차마다
+// 재판정된다). [§7.1, §7.1-3, §8.1, R21, R22]
 //
-// R21: resources 명시 → 탐지값을 상한으로 cap(경고). physicalMax 0 → 오류(시작 실패).
+// R21: resources 명시 → 탐지값을 상한으로 cap(경고). physicalMax 0 의 처리는 first 로 갈린다:
+// 그 머신의 최초 판정(시작 시)이면 오류(시작 실패), 이미 통과했던 머신의 재판정이면 오류가 아니라
+// physicalMax 0 반영 + 경고다 — 배치는 physicalMax 0 만으로 막히고, Failed 는 런타임에 예산이 줄어든
+// 환경 변화가 아니라 시작 시 판정하지 못한 정적 모순을 위한 것이다. [§7.1 재접속 회차]
 // R22: maxRunners > physicalMax → 경고 후 cap.
-func (c *Controller) applyInfo(m *domain.Machine, info runtime.Info) error {
+//
+// 호출자는 applyInfoAtStart / applyInfoOnResync 다: R21 위반이 오류가 되는 경로는 전자뿐이라
+// 반환 규약을 이름으로 드러낸다(후자는 오류를 돌려줄 일이 없다).
+func (c *Controller) applyInfo(m *domain.Machine, info runtime.Info, first bool) error {
 	cm := c.cfgMachine(m.Name)
 	ss := c.scaleSets[m.ScaleSet]
 	detected := resource.Budget{CPU: info.CPUs, MemoryBytes: info.MemoryBytes}
@@ -373,7 +385,23 @@ func (c *Controller) applyInfo(m *domain.Machine, info runtime.Info) error {
 	}
 	physical := plan.PhysicalMax(budget, ss.Unit)
 	if physical == 0 {
-		return checkR21(cm, ss.Unit, ss.Name, info)
+		err := checkR21(cm, ss.Unit, ss.Name, info)
+		if first {
+			return err
+		}
+		if !c.r21Violated[m.Name] { // 전이 시점 1회만. 이후 회차는 Debug
+			c.r21Violated[m.Name] = true
+			c.log.Error("machine budget shrank below unit budget, physicalMax 0", "machine", m.Name, "err", err)
+		} else {
+			c.log.Debug("machine budget still below unit budget", "machine", m.Name, "err", err)
+		}
+		c.budgets[m.Name] = budget
+		m.PhysicalMax, m.EffectiveMax = 0, 0
+		return nil
+	}
+	if c.r21Violated[m.Name] {
+		delete(c.r21Violated, m.Name)
+		c.log.Info("machine budget recovered", "machine", m.Name, "cpu", budget.CPU, "memoryBytes", budget.MemoryBytes)
 	}
 	if cm.MaxRunners != nil && *cm.MaxRunners > physical {
 		c.log.Warn("R22 machine maxRunners exceeds physicalMax, capped", "machine", m.Name, "maxRunners", *cm.MaxRunners, "physicalMax", physical)
@@ -389,6 +417,20 @@ func (c *Controller) applyInfo(m *domain.Machine, info runtime.Info) error {
 	log("machine ready", "machine", m.Name, "cpu", budget.CPU, "memoryBytes", budget.MemoryBytes,
 		"physicalMax", physical, "effectiveMax", m.EffectiveMax)
 	return nil
+}
+
+// applyInfoAtStart 는 시작 시 preflight 결과의 반영이다(= 그 머신의 최초 판정). R21 위반은
+// 오류이며 호출자가 시작 실패로 올린다. [§7.1-3, R21]
+func (c *Controller) applyInfoAtStart(m *domain.Machine, info runtime.Info) error {
+	return c.applyInfo(m, info, true)
+}
+
+// applyInfoOnResync 는 재동기화가 실어 온 그 회차의 info 반영이다(= 재판정). R21 위반이어도
+// 오류가 아니다: physicalMax 0 + 경고이고 health 는 건드리지 않는다. 그래서 반환값이 없다 —
+// 여기서 Failed 로 가는 경로는 존재하지 않는다(그 등급은 에이전트의 ErrFatal 뿐이다).
+// [§7.1 재접속 회차, R21]
+func (c *Controller) applyInfoOnResync(m *domain.Machine, info runtime.Info) {
+	_ = c.applyInfo(m, info, false)
 }
 
 // r21Budget 은 R21 의 cap 규칙을 적용한 머신 예산이다: resources 생략이면 탐지값, 명시면

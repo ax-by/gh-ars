@@ -26,6 +26,7 @@
 - (executor/ssh) keepalive 판정(상태 기계): 실패는 miss 증가, 성공은 리셋, **응답 없는 프로브는 주기마다 miss**, 상한 도달 시 단절. stop 시 루프 종료 (§10.1, §8.3).
 - (executor/ssh) known_hosts 재시도 목록에서 RSA 항목은 `rsa-sha2-256/512`로 펼친다(OpenSSH 8.8+ 는 SHA-1 서명을 끈다) (§10.1, R20).
 - (executor/local) `Cmd.Sudo` 접두, stdin 전달, Stream 종료 통지 (§5).
+- (runtime/docker), (runtime/podman) `ImageExists`: `image inspect` argv(podman 은 고정된 sudo 경로 전파), "이미 없음" 응답만 false, 그 밖의 실패(데몬 접속 불가 등)는 오류 (§7.1-4, DESIGN §4.2).
 - (runtime/docker) `Info`의 rootless 판정(`SecurityOptions`의 `name=rootless`), docker argv 조립과 출력 파싱: ps -a 라벨 필터, none create 플래그(--cpus/--memory, 라벨, entrypoint 래퍼), events JSON 정규화, `Info` 파싱 (DESIGN §4.2).
 - (runtime/docker), (runtime/podman) 읽지 못한 줄 판정: 깨진 JSON·`type != container`·이름 없음은 전부 이상 신호이며, 첫 줄은 즉시 경고 로그, 집계는 스트림 종료 오류에 실린다 (DESIGN §4.2).
 - (runtime/podman) podman과 docker의 차이: events JSON 필드(**픽스처는 실제 podman 출력을 캡처한 것이어야 한다** — 지어낸 스키마는 파서가 모든 줄을 버려도 통과한다), 시각 필드의 정수·문자열 양쪽 수용, 읽지 못한 줄이 스트림 종료 오류에 실리는지, `Info`의 `v2` → `2`·`Rootless`, `Cmd.Sudo` 접두 전파 (DESIGN §4.2, §10.2 규칙 3).
@@ -35,7 +36,9 @@
 - (github) `CheckAuth`가 그룹 조회로 인증을 확인하고(`Default` 정규화 포함) 실패를 그대로 올린다 (§7.1-2, R7).
 - (github) `GetRunner`의 `(nil, nil)` → found=false, `RemoveRunner`의 `RunnerNotFoundError` → nil, `IsBusy` 판정, `Default` 대소문자 무시 (§8.3, R7).
 - (machine) podman 경로 고정 규칙(§10.2 규칙 3)의 none/sidecar 분기, `id -u` 분기, R16 판정(rootless docker·podman, cgroup, systemctl).
-- (machine) R21 재접속 후 위반 → Failed(재접속 중단).
+- (machine) R21 위반의 등급은 **그 머신을 처음 판정하는가**로 갈린다: 최초 판정(시작 시 미도달이었다가 재접속 후 드러난 경우 포함) → Failed(재접속 중단), 이미 통과했던 머신의 재판정 → Failed 도 Unhealthy 도 아니고 회차가 그대로 Resynced 까지 간다 (§7.1 재접속 회차, R21).
+- (machine) pre-pull 의 자리는 회차 종류로 갈린다: 최초 접속 회차는 events·동기화 **앞**, 재접속 회차는 Resynced **뒤**. pull 실패는 그 이미지가 이미 머신에 있으면(`ImageExists`) 경고로 낮추고 성공, 없으면 그대로 실패 (§7.1-4, §7.1 재접속 회차, R13).
+- (machine) 취소 사유 규약: 여러 단계를 덮는 회차 ctx 를 마감 타이머가 취소하면 뒤따르는 단계의 `context canceled` 가 아니라 취소 사유를 보고한다. 사유 없는 취소(부모 ctx 종료)는 치환하지 않는다 (DESIGN §1-5, §7.1-8).
 - (machine) 재접속 백오프 수열(1s→2s→…→30s cap, jitter 범위, 성공 시 리셋) (§7.1-8).
 - (controller/core) 시작 순서: 인증 확인(§7.1-2)이 preflight·pre-pull보다 앞. 인증 실패면 pull·scale set 확보 없이 시작 실패.
 - (controller/core) `msgDesired` → desired 계산 → spread → `startUnit`(create→cp→start) → `Starting`, `SetMaxRunners` 반영 (§7.2-1·3·4).
