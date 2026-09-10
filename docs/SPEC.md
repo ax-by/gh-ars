@@ -387,6 +387,8 @@ unit id를 알 수 없는 고아 등록(GenerateJIT 직후·컨테이너 create 
 - sidecar는 호스트 root와 동등한 권한을 가진다. CI 전용 머신에만 연결한다. **local 머신을 sidecar scale set에 연결하면 gh-ars 호스트에서 `--privileged` 컨테이너가 뜬다.** 공용 PC·노트북은 none scale set에만 연결한다.
 
 ### 9.2 전제 (preflight, R16)
+R16은 **환경 모순**만 판정한다: 아래 전제가 확인 결과로 어긋난 경우다. 명령이 실패해 확인 자체를 못 한 경우(데몬 다운, SSH 명령 실패)는 R16이 아니라 unhealthy이며 재접속에서 다시 본다(§7.1-3 분류, §10.2 규칙 2·3).
+
 - rootful docker 또는 rootful podman. rootless면 오류. 판정은 위 `info` 결과에서 한다: podman은 `host.security.rootless`, docker는 `SecurityOptions`에 `name=rootless` 항목이 있는지로 본다(docker에는 전용 필드가 없다).
 - cgroup v2 + systemd cgroup 드라이버. preflight는 머신마다 `info --format '{{json .}}'`를 **한 번** 실행해 아래 필드를 읽는다(값만 규범이고 조회는 한 번으로 묶는다):
   - docker: `CgroupDriver` == `systemd`, `CgroupVersion` == `2`
@@ -434,8 +436,8 @@ gh-ars는 root가 아닌 사용자로 실행할 때 root가 필요한 명령에�
 
 판단 규칙(preflight, 머신별):
 1. `id -u`로 root 여부를 본다.
-2. docker: sudo를 쓰지 않는다. `docker info` 실패 → none은 unhealthy, sidecar는 R16 오류.
-3. podman: `podman info`를 시도하고, 실패하면 `sudo -n podman info`를 시도한다(모드 무관). 성공한 경로(sudo 없음 / `sudo -n`)를 그 머신의 podman 경로로 고정하고 이후 **모든 podman 명령**에 적용한다. 둘 다 실패 → none은 unhealthy, sidecar는 R16 오류.
+2. docker: sudo를 쓰지 않는다. `docker info` 실패는 **모드와 무관하게 unhealthy**(도달 불가·명령 실패, §7.1-3 분류). R16은 환경 모순에만 쓴다 — 데몬이 잠시 죽은 것을 R16으로 올리면 재접속 회차에서 그 머신이 `Failed`로 영구 제외된다.
+3. podman: `podman info`를 시도하고, 실패하면 `sudo -n podman info`를 시도한다(모드 무관). 성공한 경로(sudo 없음 / `sudo -n`)를 그 머신의 podman 경로로 고정하고 이후 **모든 podman 명령**에 적용한다. 둘 다 실패 → 규칙 2와 같이 모드와 무관하게 unhealthy.
    고정은 **머신 단위로 프로세스 수명 동안** 유지한다: 재접속 preflight는 이 협상을 다시 하지 않고 고정된 경로만 시도하며, 그 경로가 실패하면 다른 경로로 갈아타지 않고 unhealthy로 둔다. rootless와 rootful은 컨테이너 저장소가 달라, 경로가 바뀌면 이미 실행 중인 unit이 보이지 않게 되고 전체 동기화가 그 부품을 "사라졌다"고 판정해 지운다(§8.3).
    sidecar scale set 머신은 추가로: 고정된 경로의 `Rootless=true`이면(rootless podman은 `podman info`가 성공하지만 sidecar에 못 쓴다) 아직 시도하지 않은 `sudo -n podman info`를 시도해 rootful을 얻으면 그 경로로 바꾼다. 그래도 rootful을 못 얻으면 R16 오류.
    none은 어느 경로든 성공하면 healthy(rootless 허용).
@@ -443,7 +445,7 @@ gh-ars는 root가 아닌 사용자로 실행할 때 root가 필요한 명령에�
 
 | runtime | mode | 요구 권한 | preflight 확인 |
 |---|---|---|---|
-| docker | none | `docker` 그룹 멤버 또는 root | `docker info` 성공 |
+| docker | none | `docker` 그룹 멤버 또는 root | `docker info` 성공(실패는 unhealthy) |
 | docker | sidecar | 위 + rootful 데몬 + root 또는 passwordless sudo: `systemctl set-property/stop/revert` (`gh-ars-*.slice` 한정) | `info`의 `SecurityOptions`에 `name=rootless` 없음, `sudo -n systemctl --version` 성공 |
 | podman | none | rootless: 일반 사용자. rootful: root 또는 passwordless sudo `podman` | `podman info` 또는 `sudo -n podman info` 중 하나 성공(규칙 3) |
 | podman | sidecar | root 또는 passwordless sudo: `podman`, `systemctl set-property/stop/revert` | 규칙 3으로 고정된 경로의 `Rootless=false`, `sudo -n systemctl --version` 성공 |

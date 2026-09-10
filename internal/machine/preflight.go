@@ -166,11 +166,10 @@ func (a *Agent) fixRuntimePath(ctx context.Context, ex executor.Executor) (runti
 	return nil, false, runtime.Info{}, fmt.Errorf("%w: runtime %q 머신 %q", ErrUnsupported, a.spec.Runtime, a.name)
 }
 
-// infoFailure 는 `info` 실패의 분류다: none 은 unhealthy(재시도), sidecar 는 R16 오류. [§10.2 규칙 2·3]
+// infoFailure 는 `info` 실패의 분류다: 모드와 무관하게 도달 불가(unhealthy)로 본다.
+// R16 은 환경 모순(rootless·cgroup·권한)에만 쓴다 — 데몬이 잠시 죽은 것을 R16 으로 올리면
+// 재접속 회차에서 그 머신이 Failed 로 영구 제외되어 살아나지 못한다. [§10.2 규칙 2·3, §9.2, §7.1-3]
 func (a *Agent) infoFailure(what string, err error) error {
-	if a.spec.Mode == domain.ModeSidecar {
-		return fatalf("R16 머신 %q: %s 실패: %s", a.name, what, err)
-	}
 	return fmt.Errorf("preflight: %s: %w", what, err)
 }
 

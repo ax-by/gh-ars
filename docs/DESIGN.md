@@ -215,7 +215,7 @@ package runtime
 type Info struct {
     CPUs          float64
     MemoryBytes   int64
-    Rootless      bool          // podman 만 의미
+    Rootless      bool          // podman: host.security.rootless / docker: SecurityOptions 의 name=rootless [§9.2]
     CgroupDriver  string        // "systemd" 기대
     CgroupVersion string        // "2" 기대. podman 의 "v2" 는 "2" 로 정규화
 }
@@ -473,14 +473,14 @@ JIT 생성(GitHub) → [sidecar: slice Create, 볼륨 3개 Create, sidecar 컨�
 
 머신마다 goroutine 하나. 책임: 접속 유지, preflight, pre-pull, `Events` 스트림 수신 → `msgEvent`, 단절 시 백오프 재접속 → 재접속 후 `Observe()`(ps -a, 볼륨, slice) → `msgResynced`. Controller는 `Agent.Runtime()`, `Agent.Slices()`로 명령을 보낸다.
 
-`Run(ctx, sink)`의 회차: `Events` 열기 → `info`(데몬 생존) → `Observe`(관측 시각 기록) → `Resynced` → 스트림 소비. **events를 먼저 열고 관측한다**(반대면 그 사이의 die를 놓친다). 열기 직후 스트림이 이미 끝나 있으면 `Resynced`를 보내지 않고 실패로 본다. `Resynced`를 보낸 회차라도 백오프 리셋은 스트림이 백오프 최대값(30s) 이상 유지된 경우에만 한다(§6 listener 세션과 동일 기준). 유지 시간은 회차 전체가 아니라 events 스트림이 열려 있던 시간으로 잰다(pre-pull이 오래 걸린 회차가 스트림 즉사에도 리셋 자격을 얻으면 안 된다). 스트림이 끝나면 `Unhealthy` → 백오프 → 다음 회차. 첫 회차는 `Resynced` 또는 `Unhealthy` 중 하나를 반드시 보내며, Controller는 시작 시 머신마다 그 첫 통지를 기다린 뒤 메시지 세션을 연다(§7.1-7·8 → §7.1-9 순서. 첫 desired로 만든 unit의 die를 events가 받아야 한다). 시작 시 §7.1-7 동기화도 이 첫 회차의 `Resynced`다.
+`Run(ctx, sink)`의 회차: `Events` 열기 → `info`(데몬 생존) → `Observe`(관측 시각 기록) → `Resynced` → 스트림 소비. **events를 먼저 열고 관측한다**(반대면 그 사이의 die를 놓친다). 열기 직후 스트림이 이미 끝나 있으면 `Resynced`를 보내지 않고 실패로 본다. `Resynced`를 보낸 회차라도 백오프 리셋은 스트림이 백오프 최대값(30s) 이상 유지된 경우에만 한다(§6 listener 세션과 동일 기준). 유지 시간은 회차 전체가 아니라 events 스트림이 열려 있던 시간으로 잰다(pre-pull이 오래 걸린 회차가 스트림 즉사에도 리셋 자격을 얻으면 안 된다). 스트림이 끝나면 `Unhealthy` → 백오프 → 다음 회차. 첫 회차는 `Resynced`·`Unhealthy`·`Failed`(설정·환경 모순이 드러난 경우, §3.3) 중 하나를 반드시 보내며, Controller는 시작 시 머신마다 그 첫 통지를 기다린 뒤 메시지 세션을 연다(§7.1-7·8 → §7.1-9 순서. 첫 desired로 만든 unit의 die를 events가 받아야 한다). 시작 시 §7.1-7 동기화도 이 첫 회차의 `Resynced`다.
 
 preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 1. SSH 머신: host key 검증 후 접속(타임아웃 10s). local: 생략.
 2. `id -u` → root 여부.
 3. runtime `info`:
-   - docker: `docker info`(sudo 없음). 실패 → none은 unhealthy, sidecar는 R16 오류.
-   - podman: `podman info` → 실패면 `sudo -n podman info`(모드 무관). 성공한 경로를 `Machine.Sudo`로 고정. 둘 다 실패 → none은 unhealthy, sidecar는 R16 오류. sidecar이고 고정 경로의 `Rootless=true`면 아직 시도하지 않은 `sudo -n podman info`를 시도해 rootful이면 `Sudo=true`로 바꾸고, 그래도 rootless면 R16 오류. [§10.2 규칙 3]
+   - docker: `docker info`(sudo 없음). 실패는 모드와 무관하게 unhealthy(R16은 환경 모순 전용, SPEC §9.2 머리말).
+   - podman: `podman info` → 실패면 `sudo -n podman info`(모드 무관). 성공한 경로를 `Machine.Sudo`로 고정. 둘 다 실패 → 모드와 무관하게 unhealthy. sidecar이고 고정 경로의 `Rootless=true`면 아직 시도하지 않은 `sudo -n podman info`를 시도해 rootful이면 `Sudo=true`로 바꾸고, 그래도 rootless면 R16 오류. [§10.2 규칙 3]
 4. sidecar scale set이면: rootful 확인(`Info.Rootless == false` — podman은 3단계에서 이미 걸리고 docker는 여기가 유일한 판정 지점이다), `CgroupDriver == systemd && CgroupVersion == 2` 확인, `Slices.Check()`(root 아니면 sudo -n) → 실패 시 R16 오류.
 5. resources: 생략 시 `info`의 CPUs/MemoryBytes, 명시 시 탐지값으로 cap(R21 경고). physicalMax·effectiveMax 계산(R21 오류, R22 경고).
 6. pre-pull: runner 이미지, sidecar면 sidecar 이미지. 실패 → unhealthy.

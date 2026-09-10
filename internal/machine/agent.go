@@ -359,6 +359,10 @@ func (a *Agent) serve(ctx context.Context, sink Sink) round {
 	// 이미 닫힌 채널 + errCh 로 알린다. [§7.1-8]
 	select {
 	case err := <-errCh:
+		// 취소부터 하고 비운다. Runtime.Events 계약은 "errCh 통지 후 두 채널을 닫는다" 지만,
+		// 그 계약을 어기는(또는 아직 닫는 중인) 구현을 만나면 여기서 영원히 멈춰 이 머신은
+		// 재접속도 Unhealthy 통지도 하지 못한다. 취소하면 어느 구현이든 스트림이 풀린다. [§7.1-8]
+		cancel()
 		drain(evCh, nil)
 		return round{life: life(), err: fmt.Errorf("events: %w", err)}
 	default:

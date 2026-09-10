@@ -201,15 +201,16 @@ func TestPreflight_S10_2_DockerNoSudo(t *testing.T) {
 	}
 }
 
-// TestPreflight_S10_2_DockerInfoFailure: `docker info` 실패는 none 이면 unhealthy(재시도 대상),
-// sidecar 면 R16 오류다. [§10.2 규칙 2, R16]
+// TestPreflight_S10_2_DockerInfoFailure: `docker info` 실패는 **모드와 무관하게** unhealthy 다.
+// 데몬이 잠시 죽은 것을 R16(설정·환경 모순)으로 올리면 재접속 회차에서 그 머신이 Failed 로
+// 영구 제외되어 살아나지 못한다. R16 은 rootless·cgroup·권한 같은 환경 모순에만 쓴다. [§10.2 규칙 2, §9.2]
 func TestPreflight_S10_2_DockerInfoFailure(t *testing.T) {
 	for _, tc := range []struct {
 		mode  domain.Mode
 		fatal bool
 	}{
 		{domain.ModeNone, false},
-		{domain.ModeSidecar, true},
+		{domain.ModeSidecar, false},
 	} {
 		ex := &fakeExec{h: uid("0", func(_ bool, argv []string) (executor.Result, error) {
 			if isCmd(argv, "docker", "info") {
@@ -268,14 +269,15 @@ func TestPreflight_S10_2_PodmanSudoPathFixed(t *testing.T) {
 	}
 }
 
-// TestPreflight_S10_2_PodmanBothPathsFail: 둘 다 실패면 none 은 unhealthy, sidecar 는 R16 오류. [§10.2 규칙 3]
+// TestPreflight_S10_2_PodmanBothPathsFail: 두 경로 모두 실패면 모드와 무관하게 unhealthy 다
+// (환경 모순이 아니라 도달 불가이므로 재접속에서 다시 본다). [§10.2 규칙 3, §9.2]
 func TestPreflight_S10_2_PodmanBothPathsFail(t *testing.T) {
 	for _, tc := range []struct {
 		mode  domain.Mode
 		fatal bool
 	}{
 		{domain.ModeNone, false},
-		{domain.ModeSidecar, true},
+		{domain.ModeSidecar, false},
 	} {
 		ex := &fakeExec{h: uid("1000", func(_ bool, argv []string) (executor.Result, error) {
 			if isCmd(argv, "podman", "info") {
