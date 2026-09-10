@@ -10,6 +10,7 @@
 2. **상태는 단일 goroutine이 소유한다.** 모든 상태 변경(이벤트, GitHub 콜백, 타이머)은 하나의 `Controller` 루프로 직렬화한다. 락 대신 채널.
 3. **진실은 머신에 있다.** 메모리 상태는 캐시이며, 전체 동기화로 언제든 재구성할 수 있어야 한다. [§5, §8.3]
 4. **actions/scaleset의 `listener`를 그대로 쓴다.** 세션·long-poll·ack·acquire를 재구현하지 않는다. 우리는 `listener.Scaler` 인터페이스만 구현한다.
+5. **마감은 그것이 덮는 작업 하나에만 건다.** 상한이 필요한 명령에는 그 명령만 감싸는 `context.WithTimeout`을 주고, 그러면 실패 사유가 곧 `context.DeadlineExceeded`다. 여러 단계를 덮는 ctx를 타이머로 취소해야 하는 자리(§7의 events 열기 상한이 유일하다)에서는 **취소한 주체가 사유를 남기고(`context.WithCancelCause`) 그 ctx 하위에서 나온 `context.Canceled`는 원인으로 보고하지 않는다** — `context.Cause`로 되돌려 보고한다. 그러지 않으면 취소 뒤의 모든 단계가 `context.canceled`로 끝나 진짜 원인(여기서는 "events 열기가 상한을 넘었다")이 "데몬이 죽었다"처럼 보인다. 사유 없는 취소(부모 ctx 종료)는 치환하지 않는다.
 
 ## 2. 패키지 구조
 
@@ -485,7 +486,7 @@ preflight 순서 (SPEC §10.2 판단 규칙과 §7.1-3):
 5. resources: 생략 시 `info`의 CPUs/MemoryBytes, 명시 시 탐지값으로 cap(R21 경고). physicalMax·effectiveMax 계산(R21 오류, R22 경고).
 6. pre-pull: runner 이미지, sidecar면 sidecar 이미지. 실패 → unhealthy.
 
-2~5단계의 확인 명령과 관측(`ps`, `volume ls`), events 스트림 **열기**에는 probe 상한(§8.3 상수 표)을 건다. 열기에만 거는 이유는 스트림 자체가 장기 실행이기 때문이고, 상한은 열기 구간에만 타이머로 스트림 ctx를 취소해 건다. 6단계 pull은 이미지 크기에 비례하므로 별도의 pre-pull 상한(§8.3)을 쓴다.
+2~5단계의 확인 명령과 관측(`ps`, `volume ls`), events 스트림 **열기**에는 probe 상한(§8.3 상수 표)을 건다. 열기에만 거는 이유는 스트림 자체가 장기 실행이기 때문이고, 상한은 열기 구간에만 타이머로 스트림 ctx를 취소해 건다. 그 ctx는 같은 회차의 `info`·관측·스트림 소비까지 덮으므로 §1-5의 취소 사유 규약을 쓴다(`watchdog`이 사유를 남기고 `reported`가 치환한다). 6단계 pull은 이미지 크기에 비례하므로 별도의 pre-pull 상한(§8.3)을 쓴다.
 
 시작 시와 재접속 시의 차이: 시작 시 R16/R21 오류는 프로세스 시작 실패. 재접속 후 preflight에서 같은 오류가 나면 `msgHealth{Failed}`를 보내고 에이전트 goroutine을 종료한다(재접속 없음). R24는 Controller가 시작 시 한 번 평가한다: 전 머신 도달이면 위반 시 시작 실패, 미도달 머신이 있으면 경고. [§6.2 R21, R24]
 

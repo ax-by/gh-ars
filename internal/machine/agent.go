@@ -320,14 +320,15 @@ func (a *Agent) serve(ctx context.Context, sink Sink) round {
 		a.live = false
 		return round{err: errors.New("접속 없음")}
 	}
-	ectx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	ectx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	// events 스트림 자체에는 상한이 없어야 하지만 **여는 동안**은 원격 응답을 기다린다(SSH 는 채널
 	// 개설·exec ack). 여기서 매달리면 이 머신의 첫 통지가 오지 않아 모든 scale set 의 세션 시작이
-	// 막히므로(§7.1-7 → §7.1-9), 열기 구간만 타이머로 ectx 를 취소해 상한을 건다. [§7.1-8, §10.1]
-	openTimer := time.AfterFunc(probeTimeout, cancel)
+	// 막히므로(§7.1-7 → §7.1-9), 열기 구간만 타이머로 ectx 를 취소해 상한을 건다. ectx 는 이 회차의
+	// 뒤따르는 단계까지 덮으므로 취소 사유 규약을 쓴다(아래 watchdog/reported). [§7.1-8, §10.1]
+	stopOpenTimer := watchdog(cancel, probeTimeout, fmt.Errorf("%w: %v", errEventsOpenTimeout, probeTimeout))
 	evCh, errCh := rt.Events(ectx, domain.UnitLabelFilter)
-	openTimer.Stop()
+	stopOpenTimer()
 	openedAt := time.Now()
 	life := func() time.Duration { return time.Since(openedAt) }
 	// 즉시 끝나야 하는 확인 명령에만 상한을 건다.
@@ -335,24 +336,26 @@ func (a *Agent) serve(ctx context.Context, sink Sink) round {
 	info, err := rt.Info(ictx)
 	icancel()
 	if err != nil {
-		cancel()
+		cancel(nil)
 		drain(evCh, errCh)
-		return round{life: life(), err: fmt.Errorf("info: %w", err)}
+		// 열기 상한이 ectx 를 취소했으면 Info 도 "context canceled" 로 끝난다. 그것을 그대로
+		// 보고하면 데몬이 죽은 것처럼 보이므로 reported 가 실제 사유로 되돌린다.
+		return round{life: life(), err: reported(ectx, fmt.Errorf("info: %w", err))}
 	}
 	// 회차마다 그 회차의 info 로 예산을 다시 판정한다(R21). preflight 를 건너뛰는 회차(local 의
 	// events 재시작)에도 위반이 드러나면 Failed 가 되어 goroutine 이 끝나야 하기 때문이다. [§7.1-3, R21]
 	if a.spec.Verify != nil {
 		if err := a.spec.Verify(info); err != nil {
-			cancel()
+			cancel(nil)
 			drain(evCh, errCh)
 			return round{life: life(), err: fatalf("머신 %q: %s", a.name, err)}
 		}
 	}
 	snap, err := a.Observe(ectx)
 	if err != nil {
-		cancel()
+		cancel(nil)
 		drain(evCh, errCh)
-		return round{life: life(), err: err}
+		return round{life: life(), err: reported(ectx, err)}
 	}
 	snap.Info = info // 재접속으로 healthy 가 된 머신의 예산 재계산 재료 [§7.1-3, R21, R22]
 	// 스트림이 열리자마자 끝났으면(열기 실패) healthy 로 보고하지 않는다. Runtime.Events 는 열기 실패를
@@ -362,7 +365,7 @@ func (a *Agent) serve(ctx context.Context, sink Sink) round {
 		// 취소부터 하고 비운다. Runtime.Events 계약은 "errCh 통지 후 두 채널을 닫는다" 지만,
 		// 그 계약을 어기는(또는 아직 닫는 중인) 구현을 만나면 여기서 영원히 멈춰 이 머신은
 		// 재접속도 Unhealthy 통지도 하지 못한다. 취소하면 어느 구현이든 스트림이 풀린다. [§7.1-8]
-		cancel()
+		cancel(nil)
 		drain(evCh, nil)
 		return round{life: life(), err: fmt.Errorf("events: %w", err)}
 	default:
@@ -372,6 +375,31 @@ func (a *Agent) serve(ctx context.Context, sink Sink) round {
 		sink.Event(a.name, ev)
 	}
 	return round{served: true, life: life(), err: <-errCh}
+}
+
+// errEventsOpenTimeout 은 events 열기 상한이 회차 ctx 를 취소한 사유다. [§8.3 "preflight·관측 probe 상한"]
+var errEventsOpenTimeout = errors.New("events 열기 상한 초과")
+
+// 취소 사유 규약 [DESIGN §7]. 마감 ctx 는 그것이 감싸는 작업 **하나**에만 준다 — 그러면 사유가 곧
+// context.DeadlineExceeded 다. 여러 단계를 덮는 ctx 를 타이머로 취소해야 하는 자리(여기서는 events
+// 열기 상한이 회차 ctx 를 취소한다)에서만 아래 두 함수를 쓴다: 취소한 주체가 사유를 남기고,
+// 그 ctx 하위에서 나온 "context canceled" 는 원인으로 보고하지 않고 사유로 치환한다.
+// 그러지 않으면 뒤따르는 단계가 전부 취소로 끝나 진짜 원인을 가린다.
+
+// watchdog 은 d 안에 stop 이 불리지 않으면 reason 을 사유로 ctx 를 취소한다.
+func watchdog(cancel context.CancelCauseFunc, d time.Duration, reason error) (stop func()) {
+	t := time.AfterFunc(d, func() { cancel(reason) })
+	return func() { t.Stop() }
+}
+
+// reported 는 규약의 보고 쪽이다: ctx 가 우리가 남긴 사유로 취소됐으면 그 사유를, 아니면 관측한
+// 오류를 그대로 돌려준다. 사유 없는 취소(부모 ctx 종료, cancel(nil))는 치환하지 않는다.
+func reported(ctx context.Context, err error) error {
+	cause := context.Cause(ctx)
+	if cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
+		return cause
+	}
+	return err
 }
 
 // drain 은 취소한 events 스트림을 끝까지 비운다(goroutine 누수 방지).

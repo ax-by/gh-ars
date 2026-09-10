@@ -3,6 +3,7 @@ package machine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -319,5 +320,35 @@ func TestRun_R16_FailedOnFirstRound(t *testing.T) {
 	defer sink.mu.Unlock()
 	if sink.failed != 1 || sink.unhealthy != 0 {
 		t.Fatalf("failed=%d unhealthy=%d, want 1/0", sink.failed, sink.unhealthy)
+	}
+}
+
+// TestServe_S7_1_8_OpenTimeoutReportsCause: 취소 사유 규약(DESIGN §7). 여러 단계를 덮는 회차 ctx 를
+// 마감 타이머가 취소하면, 뒤따르는 단계의 "context canceled" 가 아니라 취소 사유를 보고한다. [§7.1-8]
+func TestServe_S7_1_8_OpenTimeoutReportsCause(t *testing.T) {
+	reason := errors.New("events 열기 상한 초과: 30s")
+
+	// 1) 타이머가 사유를 남기고 취소한 경우: 사유로 치환된다.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	stop := watchdog(cancel, time.Millisecond, reason)
+	<-ctx.Done()
+	stop()
+	cancel(nil) // 회차 실패 경로가 다시 취소해도 사유는 첫 취소가 남긴 것이다
+	if got := reported(ctx, fmt.Errorf("info: %w", ctx.Err())); !errors.Is(got, reason) {
+		t.Fatalf("사유로 치환되지 않았다: %v", got)
+	}
+
+	// 2) stop 이 먼저 불린 경우: 사유가 없으므로 관측한 오류를 그대로 보고한다.
+	ctx2, cancel2 := context.WithCancelCause(context.Background())
+	stop2 := watchdog(cancel2, time.Hour, reason)
+	stop2()
+	real := errors.New("docker daemon down")
+	if got := reported(ctx2, fmt.Errorf("info: %w", real)); !errors.Is(got, real) {
+		t.Fatalf("관측한 오류가 바뀌었다: %v", got)
+	}
+	// 3) 부모 ctx 종료(사유 없는 취소)도 치환하지 않는다.
+	cancel2(nil)
+	if got := reported(ctx2, fmt.Errorf("info: %w", real)); !errors.Is(got, real) {
+		t.Fatalf("사유 없는 취소가 치환됐다: %v", got)
 	}
 }
